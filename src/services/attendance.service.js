@@ -18,7 +18,7 @@ class AttendanceService {
     });
   }
 
-  async fetchAttendanceLogs(user, queryParameters) {
+  async fetchAttendanceLogs(user, queryParameters = {}) {
     const { search, date, page = 1, limit = 10 } = queryParameters;
     const offset = (parseInt(page) - 1) * parseInt(limit);
 
@@ -175,6 +175,49 @@ class AttendanceService {
           : "No Teacher Assigned",
       };
     });
+  }
+  async fetchRecordsForExport(user) {
+    let whereCondition = {};
+    if (user.role === "student") {
+      whereCondition.studentId = user.id;
+      whereCondition.instituteId = user.instituteId;
+    } else if (user.role !== "super_admin") {
+      whereCondition.instituteId = user.instituteId;
+    }
+
+    const rows = await Attendance.findAll({
+      where: whereCondition,
+      include: [
+        { model: User, as: "student", attributes: ["id", "name", "email"] },
+        {
+          model: Classroom,
+          as: "classroom",
+          attributes: ["id", "name", "section"],
+        },
+      ],
+      order: [
+        ["date", "DESC"],
+        ["createdAt", "DESC"],
+      ],
+    });
+
+    return { records: rows };
+  }
+
+  async fetchPDFData(instituteId, classId, date) {
+    const logs = await Attendance.findAll({
+      where: { classId, date, instituteId },
+      include: [
+        { model: User, as: "student", attributes: ["id", "name", "email"] },
+      ],
+      order: [["createdAt", "ASC"]],
+    });
+
+    const classroom = await Classroom.findOne({
+      where: { id: classId, instituteId },
+    });
+
+    return { logs, classroom };
   }
 }
 
