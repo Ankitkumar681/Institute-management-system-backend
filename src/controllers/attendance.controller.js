@@ -254,9 +254,6 @@ class AttendanceController {
       // 3. ✨ FIX: Extract classroom metadata info cleanly from the FIRST matched array index element
       const classroom =
         targetedLogs.length > 0 ? targetedLogs[0].classroom : null;
-      console.log(targetedLogs, "targetedLogs");
-      console.log(date, "date11");
-      console.log(classroom, "classroom11");
 
       // 4. Pass gathered records down to our HTML document design canvas builder
       const htmlContent = generateAttendanceHTML(targetedLogs, date, classroom);
