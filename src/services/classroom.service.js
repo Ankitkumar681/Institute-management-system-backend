@@ -3,24 +3,53 @@ const { Classroom } = require("../models/index");
 const { Op } = require("sequelize");
 
 class ClassroomService {
-  async createClassroom(data, actor) {
+  async createNewClassroom(instituteId, classroomData) {
+    const { name, section, academicYearId } = classroomData;
+
     return await classroomRepository.create({
-      name: data.name,
-      section: data.section,
-      instituteId: actor.instituteId, // Enforces tenant context isolation
+      name: name,
+      section: section,
+      instituteId: instituteId, // Enforces tenant context isolation
+      academicYearId: academicYearId || null, // ⚡ Securely binds the classroom to the target cycle
     });
   }
 
-  async getInstituteClassrooms(actor) {
-    return await classroomRepository.findByTenant(actor.instituteId);
+  async getInstituteClassrooms(instituteId, academicYearId = null) {
+    let whereCondition = { instituteId };
+
+    if (
+      academicYearId &&
+      academicYearId !== "" &&
+      academicYearId !== "undefined"
+    ) {
+      whereCondition.academicYearId = academicYearId;
+    }
+
+    return await classroomRepository.model.findAll({
+      where: whereCondition,
+      order: [
+        ["name", "ASC"],
+        ["section", "ASC"],
+      ],
+    });
   }
   async getPaginatedClassrooms(instituteId, params) {
-    const { search, page = 1, limit = 5 } = params;
+    const { search, page = 1, limit = 5, academicYearId } = params;
     const offset = (parseInt(page) - 1) * parseInt(limit);
 
     let whereCondition = { instituteId };
     if (search && search.trim() !== "") {
       whereCondition.name = { [Op.like]: `%${search.trim()}%` };
+    }
+    if (
+      academicYearId &&
+      academicYearId !== "" &&
+      academicYearId !== "undefined"
+    ) {
+      whereCondition.academicYearId = academicYearId;
+    }
+    if (params.classId) {
+      whereCondition.id = params.classId; // Forces the grid layout to only query this matched room entry row
     }
     if (limit === "all") {
       const rows = await Classroom.findAll({

@@ -1,46 +1,170 @@
 const attendanceRepository = require("../repositories/attendance.repository");
 const userRepository = require("../repositories/user.repository");
-const { Attendance, User, Classroom } = require("../models/index");
+const {
+  Attendance,
+  User,
+  Classroom,
+  AcademicYear,
+  AcademicYearStudent,
+} = require("../models/index");
 const crypto = require("crypto");
 const { Op } = require("sequelize");
 
 class AttendanceService {
   async markAttendance(data, actor) {
-    const { studentId, classId, date, status } = data;
+    const { studentId, date, status } = data;
+    let { classId, academicYearId } = data;
+
+    // 🚀 STEP 1: If no explicit year context is provided, fall back safely onto the institute's active cycle
+    if (!academicYearId && AcademicYear) {
+      const activeYear = await AcademicYear.findOne({
+        where: { instituteId: actor.instituteId, isActive: true },
+      });
+      if (activeYear) academicYearId = activeYear.id;
+    }
+
+    // 🚀 STEP 2: TIMELINE OVERRIDE GATE
+    // Look up the accurate classroom assignment slot this student belonged to during THIS specific educational cycle!
+    if (academicYearId) {
+      const { AcademicYearStudent } = require("../models/index");
+      const accuratePlacement = await AcademicYearStudent.findOne({
+        where: { studentId, academicYearId, instituteId: actor.instituteId },
+      });
+
+      // Override the destination classId to guarantee the log binds to Grade 10 for 2026 and Grade 9 for 2025 flawlessly!
+      if (accuratePlacement) {
+        classId = accuratePlacement.classId;
+      }
+    }
 
     return await attendanceRepository.create({
+      id: require("crypto").randomUUID(),
       instituteId: actor.instituteId,
       markedBy: actor.id,
       studentId,
-      classId,
+      classId: classId || data.classId, // Fallback onto form body variables safely
       date,
       status,
+      academicYearId: academicYearId || null,
+    });
+  }
+
+  async markBulkAttendance(records, user) {
+    if (!records || !Array.isArray(records)) {
+      const error = new Error("Malformed bulk records collection parameters.");
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const { AcademicYear, AcademicYearStudent } = require("../models/index");
+
+    // Resolve current operational active cycle tracker properties
+    const activeYear = await AcademicYear.findOne({
+      where: { instituteId: user.instituteId, isActive: true },
+    });
+
+    const targetYearId = activeYear ? activeYear.id : null;
+    const formattedRecords = [];
+
+    // 🚀 STEP 3: Iterate and calculate timeline placement for every student row in the batch array loop
+    for (const record of records) {
+      let finalClassId = record.classId;
+
+      if (targetYearId && AcademicYearStudent) {
+        const truePlacement = await AcademicYearStudent.findOne({
+          where: {
+            studentId: record.studentId,
+            academicYearId: targetYearId,
+            instituteId: user.instituteId,
+          },
+        });
+        if (truePlacement) {
+          finalClassId = truePlacement.classId;
+        }
+      }
+
+      formattedRecords.push({
+        id: require("crypto").randomUUID(),
+        studentId: record.studentId,
+        classId: finalClassId, // Maps to their true year-isolated grade node seamlessly
+        instituteId: user.instituteId,
+        date: record.date,
+        status: record.status,
+        academicYearId: targetYearId,
+      });
+    }
+
+    // Commit array batch rows directly using the Sequelize bulkCreate engine layer
+    return await Attendance.bulkCreate(formattedRecords, {
+      updateOnDuplicate: ["status", "classId", "academicYearId", "updatedAt"],
     });
   }
 
   async fetchAttendanceLogs(user, queryParameters = {}) {
-    const { search, date, page = 1, limit = 10 } = queryParameters;
+    const {
+      search,
+      date,
+      page = 1,
+      limit = 10,
+      academicYearId,
+    } = queryParameters;
     const offset = (parseInt(page) - 1) * parseInt(limit);
 
     let whereCondition = {};
+
+    // 1. Setup multi-tenant and role isolation parameters
     if (user.role === "student") {
-      // 🚀 CRITICAL FIX: Force the query to filter EXCLUSIVELY for the logged-in student's records
       whereCondition.studentId = user.id;
       whereCondition.instituteId = user.instituteId;
+    } else if (user.role === "class_teacher") {
+      // 🚀 THE TEACHER ISOLATION LAYER: Restrict to logs matching their assigned rooms for this year
+      whereCondition.instituteId = user.instituteId;
+
+      const { AcademicYearStaff } = require("../models/index");
+
+      // Look up what classrooms this specific teacher owned during the targeted academic year frame
+      const activeAssignments = await AcademicYearStaff.findAll({
+        where: {
+          teacherId: user.id,
+          academicYearId: academicYearId || null,
+          instituteId: user.instituteId,
+        },
+        attributes: ["classId"],
+        raw: true,
+      });
+
+      const assignedClassIds = activeAssignments.map((a) => a.classId);
+
+      // Force the attendance lookup to filter only by their year-specific class allocations
+      whereCondition.classId = {
+        [Op.in]:
+          assignedClassIds.length > 0
+            ? assignedClassIds
+            : ["_FORCE_EMPTY_RESULT_"],
+      };
     } else if (user.role !== "super_admin") {
-      // Admins and teachers see all logs under their institute tenant scope boundary
+      // 🏛️ INSTITUTE ADMINS & STAFF: View all logs under their school workspace tenant channel boundary natively
       whereCondition.instituteId = user.instituteId;
     }
+
     if (date && date !== "") {
       whereCondition.date = date;
     }
 
+    // Append academicYearId filter constraint into the primary log condition if active
+    if (
+      academicYearId &&
+      academicYearId !== "" &&
+      academicYearId !== "undefined"
+    ) {
+      whereCondition.academicYearId = academicYearId;
+    }
+
     let studentIncludeWhere = {};
-    // 🚀 FIX 1: Use an explicit boolean flag variable to track if search parameters are active
     let isSearching = false;
 
     if (search && String(search).trim().length > 0) {
-      isSearching = true; // ⚡ Flag set to true
+      isSearching = true;
       studentIncludeWhere[Op.or] = [
         { name: { [Op.like]: `%${String(search).trim()}%` } },
         { email: { [Op.like]: `%${String(search).trim()}%` } },
@@ -56,7 +180,6 @@ class AttendanceService {
         {
           model: User,
           as: "student",
-          // 🚀 FIX 2: Evaluate using our clean boolean indicator flag instead of Object.keys() length
           where: isSearching ? studentIncludeWhere : null,
           attributes: ["id", "name", "email"],
           required: isSearching ? true : false,
@@ -67,7 +190,10 @@ class AttendanceService {
           attributes: ["id", "name", "section"],
         },
       ],
-      order: [["createdAt", "DESC"]],
+      order: [
+        ["date", "DESC"],
+        ["createdAt", "DESC"],
+      ], // Ordered sequentially by calendar dates
     });
 
     return {
@@ -78,8 +204,40 @@ class AttendanceService {
       records: rows,
     };
   }
-  async getClassStudents(instituteId, classId) {
-    // 🚀 FIXED: Replaced non-existent legacy method with the unified BaseRepository query syntax
+  async getClassStudents(instituteId, classId, academicYearId = null) {
+    let targetYearId = academicYearId;
+
+    // Fallback: If no year constraint is explicitly passed, read the school's primary active cycle
+    if (
+      (!targetYearId || targetYearId === "undefined" || targetYearId === "") &&
+      AcademicYear
+    ) {
+      const activeYear = await AcademicYear.findOne({
+        where: { instituteId, isActive: true },
+      });
+      if (activeYear) targetYearId = activeYear.id;
+    }
+
+    // If an academic year configuration block is parsed, extract student profiles from the timeline log entries
+    if (targetYearId && AcademicYearStudent) {
+      const historyMappings = await AcademicYearStudent.findAll({
+        where: { classId, academicYearId: targetYearId, instituteId },
+        include: [
+          {
+            model: User,
+            as: "student",
+            where: { role: "student" },
+            attributes: ["id", "name", "email"],
+          },
+        ],
+        order: [[{ model: User, as: "student" }, "name", "ASC"]],
+      });
+
+      // Flatten the relational payload object structure for direct frontend backwards compatibility
+      return historyMappings.map((mapping) => mapping.student).filter(Boolean);
+    }
+
+    // Default Retro-Fallback (Keeps your recent onboarding parameters functional if no years are configured yet)
     return await userRepository.find({
       role: "student",
       classId: classId,
@@ -87,102 +245,221 @@ class AttendanceService {
     });
   }
 
-  async markBulkAttendance(records, user) {
+  // Inside src/services/attendance.service.js
+  async markBulkAttendance(records, user, academicYearId = null) {
     if (!records || !Array.isArray(records)) {
       const error = new Error("Malformed bulk records collection parameters.");
       error.statusCode = 400;
       throw error;
     }
 
-    // 🚀 FIX: Map through the array and inject actual unique string IDs for every row entry
-    const formattedRecords = records.map((record) => ({
-      id: crypto.randomUUID(), // ⚡ FIX: Injects a real unique string instead of a data type constructor rule!
-      studentId: record.studentId,
-      classId: record.classId,
-      instituteId: user.instituteId, // Securely binds the active user tenant scope boundary
-      date: record.date,
-      status: record.status,
-    }));
+    const { AcademicYear, AcademicYearStudent } = require("../models/index");
+    let targetYearId = academicYearId;
 
-    // Commit array batch rows directly using Sequelize bulkCreate engine
-    return await Attendance.bulkCreate(formattedRecords, {
-      updateOnDuplicate: ["status", "updatedAt"], // If studentId + date matches, simply update their status cell flag!
-    });
-  }
-  async fetchInstituteDashboardMetrics(user) {
-    // 1. Setup global multi-tenant validation criteria bounds
-    let classroomQueryCondition = { instituteId: user.instituteId };
-
-    // 🚀 FIX: If the user is a class teacher, restrict the query bounds strictly to their assigned classId
-    if (user.role === "class_teacher") {
-      if (!user.classId) {
-        // Return an empty array smoothly if they haven't been assigned to a class room node container yet
-        return [];
-      }
-      classroomQueryCondition.id = user.classId;
-    } else if (user.role !== "institute_admin" && user.role !== "staff") {
-      // General safety fallback rejection block
-      throw Object.assign(
-        new Error("Access Denied: Administrative boundaries only."),
-        { statusCode: 403 },
-      );
+    // Backward-Compatible Fallback: If no query string is passed, look up the primary active year
+    if (!targetYearId && targetYearId !== "0") {
+      const activeYear = await AcademicYear.findOne({
+        where: { instituteId: user.instituteId, isActive: true },
+      });
+      if (activeYear) targetYearId = activeYear.id;
     }
 
-    // 2. Fetch the targeted classroom records matching the authorization scope bounds
-    const classrooms = await Classroom.findAll({
-      where: classroomQueryCondition,
-      include: [
-        {
-          model: User,
-          as: "students",
-          required: false,
-          attributes: ["id", "name", "email", "role"],
+    const formattedRecords = [];
+
+    // Iterate and calculate correct year-scoped classroom allocations for every student in the batch
+    for (const record of records) {
+      let finalClassId = record.classId;
+
+      if (targetYearId && AcademicYearStudent) {
+        // 🚀 THE LOGIC FIX: Find the student's exact class for the SELECTED year context
+        const truePlacement = await AcademicYearStudent.findOne({
+          where: {
+            studentId: record.studentId,
+            academicYearId: targetYearId,
+            instituteId: user.instituteId,
+          },
+        });
+        if (truePlacement) {
+          finalClassId = truePlacement.classId;
+        }
+      }
+
+      formattedRecords.push({
+        id: require("crypto").randomUUID(),
+        studentId: record.studentId,
+        classId: finalClassId, // Safely maps to Grade-9 or Grade-10 based on selected context
+        instituteId: user.instituteId,
+        date: record.date,
+        status: record.status,
+        academicYearId: targetYearId,
+      });
+    }
+
+    // Commit batch rows directly into MySQL database
+    return await Attendance.bulkCreate(formattedRecords, {
+      updateOnDuplicate: ["status", "updatedAt"], // Updates cell status flags seamlessly on duplicates
+    });
+  }
+
+  async fetchInstituteDashboardMetrics(user, academicYearId = "") {
+    const {
+      Classroom,
+      AcademicYearStaff,
+      Attendance,
+      User,
+      AcademicYear,
+    } = require("../models/index");
+    const { Op } = require("sequelize");
+    const instituteId = user.instituteId;
+
+    // 🚀 STEP 1: Resolve Target Academic Year Context Fallback
+    let targetYearId = academicYearId;
+    if (!targetYearId && targetYearId !== "0" && targetYearId !== "undefined") {
+      const activeYear = await AcademicYear.findOne({
+        where: { instituteId, isActive: true },
+      });
+      if (activeYear) targetYearId = activeYear.id;
+    }
+
+    // 🚀 STEP 2: BUILD YEAR AND ROLE ISOLATION CONDITIONS
+    let classroomWhere = { instituteId };
+    let attendanceWhere = { instituteId };
+
+    if (targetYearId) {
+      classroomWhere.academicYearId = targetYearId;
+      attendanceWhere.academicYearId = targetYearId;
+    }
+
+    // 🔒 THE CLASS TEACHER ENVELOPE FILTER
+    if (user.role === "class_teacher") {
+      const activeAssignments = await AcademicYearStaff.findAll({
+        where: {
+          teacherId: user.id,
+          instituteId,
+          ...(targetYearId && { academicYearId: targetYearId }),
         },
+        attributes: ["classId"],
+        raw: true,
+      });
+      const assignedClassIds = activeAssignments.map((a) => a.classId);
+
+      // Strict constraint override: Force queries to only see their year-specific class allocations
+      const targetedIds =
+        assignedClassIds.length > 0 ? assignedClassIds : ["_FORCE_EMPTY_"];
+      classroomWhere.id = { [Op.in]: targetedIds };
+      attendanceWhere.classId = { [Op.in]: targetedIds };
+    }
+
+    // 🚀 STEP 3: COMPUTE GLOBAL STATS FOR DASHBOARD CARDS ACCORDING TO ROLE FILTER BOUNDARIES
+    const roleIsolatedLogs = await Attendance.findAll({
+      where: attendanceWhere,
+      attributes: ["status", "classId"],
+      raw: true,
+    });
+
+    let totalLogs = roleIsolatedLogs.length;
+    let presentRate = 0;
+    let absentRate = 0;
+
+    if (totalLogs > 0) {
+      const presentCount = roleIsolatedLogs.filter(
+        (l) => l.status === "Present" || l.status === "Late",
+      ).length;
+      presentRate = Math.round((presentCount / totalLogs) * 100);
+      absentRate = 100 - presentRate;
+    }
+
+    // 🚀 STEP 4: FETCH PERFORMANCE MATRIX ARRAYS FOR EACH CLASSROOM
+    const classrooms = await Classroom.findAll({
+      where: classroomWhere,
+      order: [
+        ["name", "ASC"],
+        ["section", "ASC"],
       ],
     });
 
-    // 3. Fetch historical logs context under this school tenant channel
-    const allLogs = await Attendance.findAll({
-      where: { instituteId: user.instituteId },
-      attributes: ["classId", "status"],
-    });
+    const classroomMatrix = [];
 
-    // 4. Map, loop, and return the formatted progress analytics matrix rows
-    return classrooms.map((cls) => {
-      const classLogs = allLogs.filter((log) => log.classId === cls.id);
+    for (const cls of classrooms) {
+      // Find who the teacher assigned to this classroom was for this year cycle
+      const staffMap = await AcademicYearStaff.findOne({
+        where: {
+          classId: cls.id,
+          instituteId,
+          ...(targetYearId && { academicYearId: targetYearId }),
+        },
+        include: [{ model: User, as: "teacher", attributes: ["name"] }],
+      });
 
-      let rate = 100;
-      if (classLogs.length > 0) {
-        const presentCount = classLogs.filter(
-          (l) => l.status === "Present" || l.status === "Late",
-        ).length;
-        rate = Math.round((presentCount / classLogs.length) * 100);
-      }
-
-      const membersList = cls.students || [];
-      const assignedTeacher = membersList.find(
-        (member) => member.role === "class_teacher",
+      // Pull log subsets for this row node
+      const clsLogs = roleIsolatedLogs.filter(
+        (l) => String(l.classId) === String(cls.id),
       );
+      const clsTotal = clsLogs.length;
+      const clsPresent = clsLogs.filter(
+        (l) => l.status === "Present" || l.status === "Late",
+      ).length;
 
-      return {
+      // Formulates total class rate precisely, safeguarding against NaN or 0 display bugs
+      const clsRate =
+        clsTotal > 0 ? Math.round((clsPresent / clsTotal) * 100) : 0;
+
+      classroomMatrix.push({
         id: cls.id,
         name: cls.name,
         section: cls.section,
-        totalLogs: classLogs.length,
-        rate: rate,
-        teacherName: assignedTeacher
-          ? assignedTeacher.name
-          : "No Teacher Assigned",
-      };
-    });
+        teacherName: staffMap?.teacher?.name || "Unassigned Faculty",
+        totalLogs: clsTotal,
+        rate: clsRate,
+      });
+    }
+
+    // 🚀 STEP 5: RETURN COMPILED ENVELOPE TRANSPARENTLY TO THE CONTROLLER LAYER
+    return {
+      analytics: {
+        totalLogs,
+        presentRate,
+        absentRate,
+      },
+      classMetrics: classroomMatrix,
+    };
   }
-  async fetchRecordsForExport(user) {
+  async fetchRecordsForExport(user, academicYearId = null) {
     let whereCondition = {};
+
     if (user.role === "student") {
       whereCondition.studentId = user.id;
       whereCondition.instituteId = user.instituteId;
+    } else if (user.role === "class_teacher") {
+      whereCondition.instituteId = user.instituteId;
+
+      const { AcademicYearStaff } = require("../models/index");
+      const activeAssignments = await AcademicYearStaff.findAll({
+        where: {
+          teacherId: user.id,
+          academicYearId,
+          instituteId: user.instituteId,
+        },
+        attributes: ["classId"],
+        raw: true,
+      });
+      const assignedClassIds = activeAssignments.map((a) => a.classId);
+      whereCondition.classId = {
+        [Op.in]:
+          assignedClassIds.length > 0
+            ? assignedClassIds
+            : ["_FORCE_EMPTY_RESULT_"],
+      };
     } else if (user.role !== "super_admin") {
       whereCondition.instituteId = user.instituteId;
+    }
+
+    if (
+      academicYearId &&
+      academicYearId !== "" &&
+      academicYearId !== "undefined"
+    ) {
+      whereCondition.academicYearId = academicYearId;
     }
 
     const rows = await Attendance.findAll({
@@ -204,9 +481,19 @@ class AttendanceService {
     return { records: rows };
   }
 
-  async fetchPDFData(instituteId, classId, date) {
+  async fetchPDFData(instituteId, classId, date, academicYearId = null) {
+    let logFilterCondition = { classId, date, instituteId };
+
+    if (
+      academicYearId &&
+      academicYearId !== "" &&
+      academicYearId !== "undefined"
+    ) {
+      logFilterCondition.academicYearId = academicYearId;
+    }
+
     const logs = await Attendance.findAll({
-      where: { classId, date, instituteId },
+      where: logFilterCondition,
       include: [
         { model: User, as: "student", attributes: ["id", "name", "email"] },
       ],

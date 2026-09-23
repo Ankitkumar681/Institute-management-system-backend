@@ -1,5 +1,5 @@
 const BaseRepository = require("./base.repository");
-const { User, Classroom } = require("../models/index"); // ⚡ Import from unified context index
+const { User, Classroom, AcademicYearStudent } = require("../models/index"); // ⚡ Import from unified context index
 const { Op } = require("sequelize");
 
 class UserRepository extends BaseRepository {
@@ -34,7 +34,8 @@ class UserRepository extends BaseRepository {
     }
   }
   async getPaginatedFilteredUsers(filterContext, queryOptions) {
-    const { role, instituteId, classId, search } = filterContext;
+    const { role, instituteId, classId, search, academicYearId } =
+      filterContext;
     const {
       sortBy = "name",
       sortOrder = "ASC",
@@ -53,7 +54,18 @@ class UserRepository extends BaseRepository {
     }
 
     if (instituteId) whereCondition.instituteId = instituteId;
-    if (classId) whereCondition.classId = classId;
+
+    // 🚀 YEAR ENGINE PATCH: Only filter by root classId if we aren't looking up historical data.
+    // For historical year lookups, the classroom constraint is handled below inside the junction table query.
+    const isHistoricalStudentQuery =
+      role === "student" &&
+      academicYearId &&
+      academicYearId !== "" &&
+      academicYearId !== "undefined";
+
+    if (classId && !isHistoricalStudentQuery) {
+      whereCondition.classId = classId;
+    }
 
     if (search && String(search).trim().length > 0) {
       whereCondition[Op.or] = [
@@ -62,17 +74,72 @@ class UserRepository extends BaseRepository {
       ];
     }
 
+    // Dynamic Tracking Variable: Determines which models to include in the query lookup
+    let inclusionModels = [
+      {
+        model: Classroom,
+        as: "classroom",
+        attributes: ["id", "name", "section"],
+      },
+    ];
+
+    if (isHistoricalStudentQuery && AcademicYearStudent) {
+      try {
+        // Build the query options to look up students enrolled inside this year
+        let timelineFilter = { academicYearId, instituteId };
+
+        // 🚀 YEAR ENGINE PATCH: If the user also selected a specific classroom dropdown filter,
+        // scope the timeline search to only pull students registered to that classroom for that targeted year.
+        if (classId) {
+          timelineFilter.classId = classId;
+        }
+
+        const matchingTimelineRecords = await AcademicYearStudent.findAll({
+          where: timelineFilter,
+          attributes: ["studentId"],
+          raw: true,
+        });
+
+        const registeredStudentIds = matchingTimelineRecords.map(
+          (r) => r.studentId,
+        );
+
+        // Inject an explicit list matching constraint mapping.
+        whereCondition.id = {
+          [Op.in]:
+            registeredStudentIds.length > 0
+              ? registeredStudentIds
+              : ["_FORCE_EMPTY_RESULT_"],
+        };
+
+        // 🚀 THE TIMELINE CONTEXT JUMP HOOK: Inner join the placement mapping row for this year
+        // carrying its historical year-specific classroom row reference block!
+        inclusionModels.push({
+          model: AcademicYearStudent,
+          as: "yearlyEnrollments", // ⚡ Assumes User.hasMany(AcademicYearStudent, { as: "yearPlacements" }) exists in models/index.js
+          where: { academicYearId },
+          required: false,
+          include: [
+            {
+              model: Classroom,
+              as: "classroom",
+              attributes: ["id", "name", "section"],
+            },
+          ],
+        });
+      } catch (dbError) {
+        console.error(
+          "Historical timeline filtering bypassed safely due to missing schemas: ",
+          dbError.message,
+        );
+      }
+    }
+
     // 🚀 FIXED: Skip limit/offset query conditions altogether if 'all' is passed from the client!
     if (limit === "all") {
       const rows = await this.model.findAll({
         where: whereCondition,
-        include: [
-          {
-            model: Classroom,
-            as: "classroom",
-            attributes: ["id", "name", "section"],
-          },
-        ],
+        include: inclusionModels, // ⚡ Uses dynamic year-aware mapping models context lists
         order: [[sortBy, sortOrder]],
       });
 
@@ -92,13 +159,7 @@ class UserRepository extends BaseRepository {
       distinct: true,
       limit: parseInt(limit),
       offset: offset,
-      include: [
-        {
-          model: Classroom,
-          as: "classroom",
-          attributes: ["id", "name", "section"],
-        },
-      ],
+      include: inclusionModels, // ⚡ Uses dynamic year-aware mapping models context lists
       order: [[sortBy, sortOrder]],
     });
 

@@ -14,7 +14,7 @@ class AttendanceRepository extends BaseRepository {
         model: User,
         as: 'student',
         attributes: ['id', 'name', 'email']
-      }
+      },
     ]);
   };
   async getClassStudents(instituteId, classId) {

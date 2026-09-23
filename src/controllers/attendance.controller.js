@@ -2,7 +2,7 @@ const { Parser } = require("json2csv");
 const puppeteer = require("puppeteer");
 const attendanceService = require("../services/attendance.service");
 const AttendanceResource = require("../resources/attendance.resource");
-const { User } = require("../models/index");
+const { User, Classroom } = require("../models/index");
 
 const generateAttendanceHTML = (records, date, classroom) => {
   const className = classroom
@@ -104,7 +104,14 @@ class AttendanceController {
 
   async fetchLogs(req, res) {
     try {
-      const { search, searchLog, date = "", page = 1, limit = 10 } = req.query;
+      const {
+        search,
+        searchLog,
+        date = "",
+        page = 1,
+        limit = 10,
+        academicYearId = "",
+      } = req.query;
 
       // Fallback merge supporting both param variant bindings
       let activeSearchQuery = "";
@@ -120,6 +127,7 @@ class AttendanceController {
           date,
           page,
           limit,
+          academicYearId,
         },
       );
 
@@ -130,38 +138,82 @@ class AttendanceController {
   }
   async fetchClassRoster(req, res) {
     try {
-      const { classId } = req.query;
-      const { role, classId: assignedClassId } = req.user;
+      const { classId, academicYearId, date } = req.query; // 🚀 ADDED: date variable extraction
+      const { role, id: userId } = req.user;
+      const instituteId = req.user.instituteId;
 
-      // 🚀 FIX: Fallback to lookup the user live if the token payload field is unpopulated
-      let instituteId = req.user.instituteId;
-      if (!instituteId) {
-        const dbUser = await User.findByPk(req.user.id);
-        instituteId = dbUser ? dbUser.instituteId : null;
+      if (!classId || !date) {
+        return res
+          .status(400)
+          .json({
+            message:
+              "Parameters Missing: Both classId and date fields are required.",
+          });
       }
 
-      // 🚀 ENFORCE RESTRICTION GUARD FOR CLASS TEACHERS
+      // 1. Upgraded Dynamic Year-Aware Security Guard (Preserved exactly)
       if (role === "class_teacher") {
-        if (!assignedClassId) {
-          return res.status(403).json({
-            message:
-              "Access Denied: You have not been assigned to manage any classroom container yet.",
+        const { AcademicYearStaff } = require("../models/index");
+        let targetYearId = academicYearId;
+        if (!targetYearId && targetYearId !== "0") {
+          const { AcademicYear } = require("../models/index");
+          const activeYear = await AcademicYear.findOne({
+            where: { instituteId, isActive: true },
           });
+          if (activeYear) targetYearId = activeYear.id;
         }
-        if (assignedClassId !== classId) {
-          return res.status(403).json({
-            message:
-              "Access Denied: You are strictly restricted from loading roster boundaries outside your assigned class.",
-          });
+
+        const validAssignment = await AcademicYearStaff.findOne({
+          where: {
+            teacherId: userId,
+            classId,
+            academicYearId: targetYearId,
+            instituteId,
+          },
+        });
+
+        if (!validAssignment) {
+          return res
+            .status(403)
+            .json({
+              message:
+                "Access Denied: You are restricted from loading roster boundaries outside your assigned class.",
+            });
         }
       }
 
-      const roster = await attendanceService.getClassStudents(
+      // 2. Fetch all students registered under this classroom cohort for this specific year
+      const rosterStudents = await attendanceService.getClassStudents(
         instituteId,
         classId,
+        academicYearId,
       );
 
-      return res.json(roster);
+      // 3. 🚀 THE UPGRADE: Query if logs have already been uploaded on disk for this date + class combo
+      const { Attendance } = require("../models/index");
+      const existingLogs = await Attendance.findAll({
+        where: { classId, date, instituteId, academicYearId },
+        attributes: ["studentId", "status"],
+        raw: true,
+      });
+
+      // Transform existing logs array into a fast hash-map dictionary lookup tool
+      const logsMap = {};
+      existingLogs.forEach((log) => {
+        logsMap[log.studentId] = log.status;
+      });
+
+      // 4. Merge existing log statuses dynamically into the student roster array objects
+      const compiledRoster = rosterStudents.map((student) => {
+        const studentRaw = student.toJSON ? student.toJSON() : student;
+        return {
+          ...studentRaw,
+          // 🔥 If attendance was already uploaded, append it! Otherwise, fall back cleanly to null/default
+          existingStatus: logsMap[studentRaw.id] || null,
+        };
+      });
+
+      return res.json(compiledRoster);
     } catch (err) {
       return res.status(500).json({ message: err.message });
     }
@@ -169,7 +221,18 @@ class AttendanceController {
   async markBulk(req, res) {
     try {
       const { records } = req.body;
-      await attendanceService.markBulkAttendance(records, req.user);
+      let { academicYearId = "" } = req.query;
+
+      // 🚀 SAFE GUARD ACCENT: If duplicate query params turn academicYearId into an Array, extract the first string item safely!
+      if (Array.isArray(academicYearId)) {
+        academicYearId = academicYearId[0];
+      }
+
+      await attendanceService.markBulkAttendance(
+        records,
+        req.user,
+        academicYearId,
+      );
       return res
         .status(201)
         .json({ message: "Bulk attendance logs registered cleanly!" });
@@ -177,10 +240,14 @@ class AttendanceController {
       return res.status(500).json({ message: err.message });
     }
   }
+
   async exportCSV(req, res) {
     try {
-      // 🚀 FIXED: Now uses the new unpaginated export method from the service layer to download ALL records
-      const result = await attendanceService.fetchRecordsForExport(req.user);
+      const { academicYearId = "" } = req.query;
+      const result = await attendanceService.fetchRecordsForExport(
+        req.user,
+        academicYearId,
+      );
       const rawLogs = result.records || [];
 
       const flattenedData = rawLogs.map((log) => {
@@ -221,8 +288,12 @@ class AttendanceController {
   }
   async fetchDashboardAnalytics(req, res) {
     try {
+      const { academicYearId = "" } = req.query;
       const analyticsData =
-        await attendanceService.fetchInstituteDashboardMetrics(req.user);
+        await attendanceService.fetchInstituteDashboardMetrics(
+          req.user,
+          academicYearId,
+        );
       return res.json(analyticsData);
     } catch (err) {
       return res.status(err.statusCode || 500).json({ message: err.message });
@@ -231,34 +302,29 @@ class AttendanceController {
   async exportPDF(req, res) {
     let browser = null;
     try {
-      const { classId, date } = req.query;
+      const { classId, date, academicYearId = "" } = req.query;
       if (!classId || !date) {
         return res.status(400).json({
           message: "Parameters Missing: Both classId and date fields required.",
         });
       }
 
-      // 1. Fetch raw logs using the unpaginated multi-tenant isolation service wrapper
-      const result = await attendanceService.fetchRecordsForExport(req.user);
-      const rawLogs = result.records || [];
+      let instituteId = req.user.instituteId;
+      if (!instituteId) {
+        const dbUser = await User.findByPk(req.user.id);
+        instituteId = dbUser ? dbUser.instituteId : null;
+      }
 
-      // 2. Filter data logs strictly to match BOTH the classId and the requested target date parameters safely
+      // ⚡ REFACTORED: Calls specialized year-scoped data compiler inside service layer
+      const { logs, classroom } = await attendanceService.fetchPDFData(
+        instituteId,
+        classId,
+        date,
+        academicYearId,
+      );
 
-      const targetedLogs = rawLogs.filter((log) => {
-        // String conversion normalization forces exact matches across strings/numbers/dates
-        const matchClass = String(log.classId) === String(classId);
-        const matchDate = String(log.date) === String(date);
-        return matchClass && matchDate;
-      });
+      const htmlContent = generateAttendanceHTML(logs, date, classroom);
 
-      // 3. ✨ FIX: Extract classroom metadata info cleanly from the FIRST matched array index element
-      const classroom =
-        targetedLogs.length > 0 ? targetedLogs[0].classroom : null;
-
-      // 4. Pass gathered records down to our HTML document design canvas builder
-      const htmlContent = generateAttendanceHTML(targetedLogs, date, classroom);
-
-      // 5. Launch the backend headless Puppeteer browser sub-process worker thread
       browser = await puppeteer.launch({
         headless: true,
         args: ["--no-sandbox", "--disable-setuid-sandbox"],
@@ -273,9 +339,7 @@ class AttendanceController {
       });
 
       await browser.close();
-      browser = null; // Clean up memory reference pointer
 
-      // 6. Stream the compiled binary file down to the React frontend interface client
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader(
         "Content-Disposition",
@@ -287,6 +351,58 @@ class AttendanceController {
       return res
         .status(500)
         .json({ message: `Server PDF Engine Fail: ${err.message}` });
+    }
+  }
+  async promoteStudentsBulk(req, res) {
+    try {
+      const { sourceClassId, targetClassId, targetAcademicYearId, studentIds } =
+        req.body;
+      const instituteId = req.user.instituteId;
+
+      if (
+        !sourceClassId ||
+        !targetClassId ||
+        !targetAcademicYearId ||
+        !Array.isArray(studentIds) ||
+        studentIds.length === 0
+      ) {
+        return res.status(400).json({
+          message:
+            "Parameters Incomplete: sourceClassId, targetClassId, targetAcademicYearId, and studentIds array are required.",
+        });
+      }
+
+      const { AcademicYearStudent } = require("../models/index");
+      const crypto = require("crypto");
+
+      // 1. Loop and build dynamic bulk-history mapping records for the new academic cycle
+      const historicalMappings = studentIds.map((studentId) => ({
+        id: crypto.randomUUID(),
+        instituteId,
+        academicYearId: targetAcademicYearId,
+        studentId,
+        classId: targetClassId,
+      }));
+
+      // 2. Commit historical mapping logs to the database using an atomic bulk operation
+       await AcademicYearStudent.bulkCreate(historicalMappings, {
+        updateOnDuplicate: ["classId", "updatedAt"]
+      });
+
+      // 3. Update the active pointers on the User records to reflect their new class placement instantly
+      const { User } = require("../models/index");
+      await User.update(
+        { classId: targetClassId },
+        { where: { id: studentIds, instituteId } },
+      );
+
+      return res.status(200).json({
+        message: `Successfully promoted ${studentIds.length} students to the new academic year cycle assignment container.`,
+      });
+    } catch (err) {
+      return res
+        .status(500)
+        .json({ message: `Promotion Engine Error: ${err.message}` });
     }
   }
 }

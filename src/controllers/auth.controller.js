@@ -35,40 +35,64 @@ class AuthController {
         sortOrder = "ASC",
         page = 1,
         limit = 5,
-      } = req.query;
+        academicYearId,
+      } = req.query; // 🚀 Capture year query params
+      const targetInstituteId = req.user.instituteId;
 
-      // 🚀 CRITICAL FIX: Fallback to lookup the admin's true live database record if token payload is unpopulated
-      let targetInstituteId = req.user.instituteId;
+      const { User, Classroom, AcademicYearStaff } = require("../models/index");
+      const { Op } = require("sequelize");
+      const offset = (parseInt(page) - 1) * parseInt(limit);
 
-      if (!targetInstituteId) {
-        const currentOperatorProfile = await User.findByPk(req.user.id, {
-          attributes: ["instituteId"],
-        });
-        if (currentOperatorProfile) {
-          targetInstituteId = currentOperatorProfile.instituteId;
-        }
+      let whereCondition = {
+        role: "class_teacher",
+        instituteId: targetInstituteId,
+      };
+      if (search) {
+        whereCondition.name = { [Op.like]: `%${String(search).trim()}%` };
       }
 
-      // If no valid institute scope container can be parsed, block request parameters defensively
-      if (!targetInstituteId) {
-        return res.status(400).json({
-          message:
-            "Authorization scope mismatch. No institute linked to your identity profile.",
-        });
-      }
+      // Pull faculty members along with their year-scoped assignment allocations rows
+      const { count, rows } = await User.findAndCountAll({
+        where: whereCondition,
+        limit: limit === "all" ? null : parseInt(limit),
+        offset: limit === "all" ? null : offset,
+        include: [
+          {
+            model: AcademicYearStaff,
+            as: "staffAssignments",
+            where: academicYearId ? { academicYearId } : {},
+            required: false,
+            include: [
+              {
+                model: Classroom,
+                as: "classroom",
+                attributes: ["id", "name", "section"],
+              },
+            ],
+          },
+        ],
+        order: [[sortBy, sortOrder]],
+      });
 
-      const result = await userRepository.getPaginatedFilteredUsers(
-        {
-          role: ["class_teacher", "staff"],
-          instituteId: targetInstituteId, // ⚡ Enforces the verified database identifier layout
-          search: search ? String(search).trim() : "",
-        },
-        { sortBy, sortOrder, page, limit },
-      );
+      // Format response cleanly so the frontend sees the correct classroom object based on the timeline choice
+      const records = rows.map((user) => {
+        const activeAssignment =
+          user.staffAssignments && user.staffAssignments[0];
+        return {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          status: user.status,
+          classroom: activeAssignment ? activeAssignment.classroom : null,
+        };
+      });
 
       return res.json({
-        ...result,
-        records: UserResource.collection(result.records),
+        totalRecords: count,
+        totalPages: Math.ceil(count / limit) || 1,
+        currentPage: parseInt(page),
+        records,
       });
     } catch (err) {
       return res.status(500).json({ message: err.message });
@@ -84,6 +108,7 @@ class AuthController {
         sortOrder = "ASC",
         page = 1,
         limit = 5,
+        academicYearId,
       } = req.query;
       const filterContext = {
         role: "student",
@@ -94,6 +119,13 @@ class AuthController {
       // Only apply the classId constraint if it's explicitly passed as a valid value
       if (classId && classId !== "" && classId !== "undefined") {
         filterContext.classId = classId;
+      }
+      if (
+        academicYearId &&
+        academicYearId !== "" &&
+        academicYearId !== "undefined"
+      ) {
+        filterContext.academicYearId = academicYearId;
       }
 
       const result = await userRepository.getPaginatedFilteredUsers(
@@ -147,10 +179,16 @@ class AuthController {
   }
   async assignTeacherClass(req, res) {
     try {
-      const { teacherId, classId } = req.body;
+      const { teacherId, classId, academicYearId } = req.body; // 🚀 NEW: Extracted year choice from body parameters
       const instituteId = req.user.instituteId;
 
-      // 1. Verify the teacher exists and belongs to this school tenant
+      if (!academicYearId) {
+        return res.status(400).json({
+          message: "Parameters Missing: academicYearId context is required.",
+        });
+      }
+
+      // 1. Verify the targeted teacher exists and belongs to this school tenant branch
       const teacher = await userRepository.findOne({
         id: teacherId,
         instituteId,
@@ -161,12 +199,33 @@ class AuthController {
           .status(404)
           .json({ message: "Teacher record not found in this institute." });
 
-      // 2. Commit class assignment mapping (set to null if removing class)
-      await teacher.update({ classId: classId || null });
+      const { AcademicYearStaff } = require("../models/index");
+      const crypto = require("crypto");
+
+      // 2. Clear out any existing assignment row for this teacher inside THIS specific year session block
+      await AcademicYearStaff.destroy({
+        where: { teacherId, academicYearId, instituteId },
+      });
+
+      // 3. If a new classId allocation link is provided, create the timeline record row entry block
+      if (classId && classId !== "" && classId !== "undefined") {
+        await AcademicYearStaff.create({
+          id: crypto.randomUUID(),
+          instituteId,
+          academicYearId,
+          teacherId,
+          classId,
+        });
+
+        // Soft Fallback: Keep current active user column updated for real-time legacy checks if needed
+        await teacher.update({ classId });
+      } else {
+        await teacher.update({ classId: null });
+      }
 
       return res.json({
-        message: "Classroom assignment synchronized successfully.",
-        data: teacher,
+        message:
+          "Classroom assignment synchronized successfully for the selected educational cycle.",
       });
     } catch (err) {
       return res.status(500).json({ message: err.message });
@@ -207,6 +266,32 @@ class AuthController {
       return res.json(resetResult);
     } catch (err) {
       return res.status(err.statusCode || 500).json({ message: err.message });
+    }
+  }
+  async importStudentsCSV(req, res) {
+    try {
+      if (!req.file)
+        return res
+          .status(400)
+          .json({ message: "No spreadsheet file uploaded." });
+
+      const { classId } = req.body;
+      const { academicYearId } = req.query; // Captures chosen session parameter contexts from network interceptors
+      const instituteId = req.user.instituteId;
+
+      const result = await authService.importStudentsBulk(
+        req.file.buffer,
+        instituteId,
+        classId,
+        academicYearId,
+      );
+
+      return res.status(200).json({
+        message: `Successfully onboarded ${result.totalImported} student profiles for this selected year context cycle.`,
+        data: result,
+      });
+    } catch (err) {
+      return res.status(500).json({ message: err.message });
     }
   }
 }

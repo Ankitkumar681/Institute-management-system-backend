@@ -1,36 +1,91 @@
 const userRepository = require("../repositories/user.repository");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const { Institute, User } = require("../models/index");
+const { Institute, User, AcademicYear } = require("../models/index");
 const sequelize = require("../config/db");
 
 class AuthService {
   async registerUser(data) {
-    const { name, email, password, role } = data;
+    const { name, email, password, role, academicYearId } = data;
+    const cleanEmail = email.trim().toLowerCase();
 
-    const existingUser = await userRepository.findByEmail(email);
-    if (existingUser)
-      throw Object.assign(new Error("Email already exists"), {
-        statusCode: 400,
-      });
+    // 🚀 STEP 1: Find if a user footprint already exists with this email address
+    const existingUser = await userRepository.findByEmail(cleanEmail);
 
+    if (existingUser) {
+      // Security Guard A: If it's a teacher or admin clashing, block it immediately
+      if (role !== "student" || existingUser.role !== "student") {
+        throw Object.assign(
+          new Error("Email already exists across system staff directories"),
+          {
+            statusCode: 400,
+          },
+        );
+      }
+
+      // ========================================================================
+      // 🚀 MULTI-YEAR CROSSOVER ENROLLMENT (Non-Breaking Promotion Route)
+      // ========================================================================
+      // The student is already a user! We just link them to the new year roster.
+      const models = require("../models/index");
+      const AcademicYearStudent = models.AcademicYearStudent;
+
+      if (AcademicYearStudent && data.classId && academicYearId) {
+        // Prevent duplicate junction enrollment seeds within the SAME active year frame
+        const alreadyLinked = await AcademicYearStudent.findOne({
+          where: {
+            academicYearId,
+            studentId: existingUser.id,
+            instituteId: data.instituteId,
+          },
+        });
+
+        if (alreadyLinked) {
+          // 🚀 FLEXIBLE UPGRADE: Instead of throwing an error, update their classroom placement dynamically!
+          await alreadyLinked.update({ classId: data.classId });
+          await existingUser.update({ classId: data.classId });
+
+          console.log(
+            `[Cross-Year Move] Re-assigned existing student ${existingUser.name} to Class ID: ${data.classId} for Year ID: ${academicYearId}`,
+          );
+          return existingUser;
+        }
+
+        // 1. Provision a new history roadmap node row entry natively
+        await AcademicYearStudent.create({
+          id: require("crypto").randomUUID(),
+          instituteId: data.instituteId,
+          academicYearId: academicYearId,
+          studentId: existingUser.id,
+          classId: data.classId,
+        });
+
+        // 2. Update their active class pointer so current dashboard sessions pick it up instantly
+        await existingUser.update({ classId: data.classId });
+
+        console.log(
+          `[Cross-Year Enrollment] Linked existing student ${existingUser.name} to new Year ID: ${academicYearId}`,
+        );
+        return existingUser; // Return the student profile safely bypassing user generation errors!
+      }
+    }
+
+    // ========================================================================
+    // STEP 2: Standard Freshman Enrollment Flow (Runs only if email is brand new)
+    // ========================================================================
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // 🚀 If role is institute_admin, run an ACID transaction to seed both tables
     if (role === "institute_admin") {
       const t = await sequelize.transaction();
       try {
-        // 1. Provision Master Tenant Container Row
         const newInstitute = await Institute.create(
-          { name, email },
+          { name, email: cleanEmail },
           { transaction: t },
         );
-
-        // 2. Create the associated Admin User mapping to the new Institute ID
         const newAdmin = await User.create(
           {
             name,
-            email,
+            email: cleanEmail,
             password: hashedPassword,
             role: "institute_admin",
             instituteId: newInstitute.id,
@@ -46,15 +101,39 @@ class AuthService {
       }
     }
 
-    // Handle standard teacher/student insertions below
-    return await User.create({
+    const newUser = await User.create({
       name,
-      email,
+      email: cleanEmail,
       password: hashedPassword,
       role,
       instituteId: data.instituteId,
       classId: data.classId || null,
     });
+
+    // Seed initial freshman year timeline maps
+    if (role === "student" && data.classId && academicYearId) {
+      try {
+        const models = require("../models/index");
+        const AcademicYearStudent = models.AcademicYearStudent;
+
+        if (AcademicYearStudent) {
+          await AcademicYearStudent.create({
+            id: require("crypto").randomUUID(),
+            instituteId: data.instituteId,
+            academicYearId: academicYearId,
+            studentId: newUser.id,
+            classId: data.classId,
+          });
+        }
+      } catch (err) {
+        console.error(
+          "Baseline tracking registry seed skipped safely: ",
+          err.message,
+        );
+      }
+    }
+
+    return newUser;
   }
   async loginUser(body) {
     const { email, password } = body;
@@ -109,7 +188,16 @@ class AuthService {
       // Inject the school properties onto the user object manually to satisfy your resource serializer
       user.institute = school;
     }
+    const activeYear = await AcademicYear.findOne({
+      where: { instituteId: user.instituteId, isActive: true },
+    });
 
+    const yearIdValue = activeYear ? activeYear.id : null;
+    if (user.setDataValue) {
+      user.setDataValue("academicYearId", yearIdValue);
+    } else {
+      user.academicYearId = yearIdValue;
+    }
     // 🚀 STEP 4: Sign and return the multi-tenant JWT session token
     const token = jwt.sign(
       {
@@ -117,6 +205,7 @@ class AuthService {
         role: user.role,
         instituteId: user.instituteId || null,
         classId: user.classId || null,
+        academicYearId: yearIdValue,
       },
       process.env.JWT_SECRET || "your_super_secret_jwt_key",
       { expiresIn: "24h" },
@@ -249,6 +338,93 @@ class AuthService {
     return {
       message: "Master account credentials password reset completed cleanly.",
     };
+  }
+  async importStudentsBulk(
+    fileBuffer,
+    instituteId,
+    targetClassId,
+    targetAcademicYearId,
+  ) {
+    if (!targetClassId || !targetAcademicYearId) {
+      throw new Error(
+        "Parameters Missing: Both Class selection and Academic Year context are required.",
+      );
+    }
+    const { User, AcademicYearStudent } = require("../models/index");
+
+    if (!AcademicYearStudent) {
+      throw new Error(
+        "Infrastructure Error: AcademicYearStudent model could not be verified inside database schema contexts.",
+      );
+    }
+    // Convert raw spreadsheet file byte buffers into clear readable lines string arrays
+    const fileContent = fileBuffer.toString("utf8");
+    const rows = fileContent
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== "");
+
+    if (rows.length <= 1)
+      throw new Error(
+        "The uploaded CSV spreadsheet file contains no student record rows.",
+      );
+
+    // Parse header rows indexes (Expected format columns: Name, Email, TemporaryPassword)
+    const recordsEnrolled = [];
+    const defaultHashedPassword = await bcrypt.hash("Student@123", 10); // Standard temporary login credential code
+
+    // Loop through row entries skipping column headers line index 0
+    for (let i = 1; i < rows.length; i++) {
+      const columns = rows[i]
+        .split(",")
+        .map((cell) => cell.trim().replace(/^["']|["']$/g, ""));
+      if (columns.length < 2 || !columns[0] || !columns[1]) continue; // Skip incomplete blank rows
+
+      const studentName = columns[0];
+      const studentEmail = columns[1].toLowerCase();
+
+      // Check if user account email exists globally first to map duplicates gracefully
+      let studentUser = await User.findOne({ where: { email: studentEmail } });
+
+      if (!studentUser) {
+        studentUser = await User.create({
+          id: crypto.randomUUID(),
+          name: studentName,
+          email: studentEmail,
+          password: defaultHashedPassword,
+          role: "student",
+          instituteId,
+          classId: targetClassId,
+        });
+      } else {
+        // Overwrite their primary class pointer to align active dashboards instantly
+        await studentUser.update({ classId: targetClassId });
+      }
+
+      // Check for or provision history timeline ledger junction table links
+      const alreadyMapped = await AcademicYearStudent.findOne({
+        where: {
+          academicYearId: targetAcademicYearId,
+          studentId: studentUser.id,
+          instituteId,
+        },
+      });
+
+      if (!alreadyMapped) {
+        await AcademicYearStudent.create({
+          id: crypto.randomUUID(),
+          instituteId,
+          academicYearId: targetAcademicYearId,
+          studentId: studentUser.id,
+          classId: targetClassId,
+        });
+      } else {
+        await alreadyMapped.update({ classId: targetClassId });
+      }
+
+      recordsEnrolled.push({ name: studentName, email: studentEmail });
+    }
+
+    return { totalImported: recordsEnrolled.length, students: recordsEnrolled };
   }
 }
 

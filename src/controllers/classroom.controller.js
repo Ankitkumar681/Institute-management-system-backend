@@ -1,19 +1,28 @@
 const classroomRepository = require("../repositories/classroom.repository");
 const classroomService = require("../services/classroom.service");
 const { Op } = require("sequelize");
-const { Classroom } = require("../models/index");
+const { AcademicYear } = require("../models/index");
 
 class ClassroomController {
   async create(req, res) {
     try {
-      const { name, section } = req.body;
+      const { name, section, academicYearId } = req.body;
       const instituteId = req.user.instituteId;
-
+      let targetYearId = academicYearId;
+      if (!targetYearId && AcademicYear) {
+        const activeYear = await AcademicYear.findOne({
+          where: { instituteId, isActive: true },
+        });
+        if (activeYear) {
+          targetYearId = activeYear.id;
+        }
+      }
       // 🚀 FIX: Check if this specific combination already exists for this institute
       const duplicateExists = await classroomRepository.findOne({
         name,
         section,
         instituteId,
+        academicYearId: targetYearId || null,
       });
 
       if (duplicateExists) {
@@ -22,10 +31,10 @@ class ClassroomController {
         });
       }
 
-      const classroom = await classroomRepository.create({
+      const classroom = await classroomService.createNewClassroom(instituteId, {
         name,
         section,
-        instituteId,
+        academicYearId: targetYearId || null,
       });
 
       return res
@@ -38,11 +47,74 @@ class ClassroomController {
 
   async getAll(req, res) {
     try {
-      const { search = "", page = 1, limit = 5 } = req.query;
+      const {
+        search = "",
+        page = 1,
+        limit = 5,
+        academicYearId = "",
+      } = req.query;
+      const instituteId = req.user.instituteId;
+
+      // 1. Structure default filter parameters container
+      let targetYearId = academicYearId;
+      let targetClassId = null;
+
+      // Backward-Compatible Fallback: If no year context is specified by query params, fetch the active period
+      if (!targetYearId && targetYearId !== "0") {
+        const { AcademicYear } = require("../models/index");
+        const activeYear = await AcademicYear.findOne({
+          where: { instituteId, isActive: true },
+        });
+        if (activeYear) {
+          targetYearId = activeYear.id;
+        }
+      }
+
+      // ========================================================================
+      // 🚀 DYNAMIC YEAR-AWARE TEACHER GUARD INTERCEPTOR
+      // ========================================================================
+      // If the requester is a class teacher, restrict lookup parameters to match their historical track
+      if (req.user.role === "class_teacher") {
+        const { AcademicYearStaff } = require("../models/index");
+
+        if (AcademicYearStaff && targetYearId) {
+          const activeAssignment = await AcademicYearStaff.findOne({
+            where: {
+              teacherId: req.user.id,
+              academicYearId: targetYearId,
+              instituteId: instituteId,
+            },
+          });
+
+          if (activeAssignment) {
+            // Force the service layer lookup conditions to match only this year-specific classroom assignment
+            targetClassId = activeAssignment.classId;
+          } else {
+            // If they aren't assigned to any class for this selected year, force an empty dataset response cleanly
+            return res.json({
+              totalRecords: 0,
+              totalPages: 1,
+              currentPage: parseInt(page),
+              limit: parseInt(limit),
+              records: [],
+            });
+          }
+        }
+      }
+
+      // 2. Forward compiled parameters down to your existing classrooms service layer
       const dataContext = await classroomService.getPaginatedClassrooms(
-        req.user.instituteId,
-        { search, page, limit },
+        instituteId,
+        {
+          search,
+          page,
+          limit,
+          academicYearId: targetYearId || null,
+          // ⚡ Pass downstream class constraint filter (will handle empty overrides naturally)
+          ...(targetClassId && { classId: targetClassId }),
+        },
       );
+
       return res.json(dataContext);
     } catch (err) {
       return res.status(500).json({ message: err.message });
@@ -84,6 +156,7 @@ class ClassroomController {
           name,
           section,
           instituteId,
+          academicYearId: classroom.academicYearId || null,
           id: { [Op.ne]: id }, // Exclude the current classroom being updated
         },
       });
