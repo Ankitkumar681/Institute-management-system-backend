@@ -143,12 +143,10 @@ class AttendanceController {
       const instituteId = req.user.instituteId;
 
       if (!classId || !date) {
-        return res
-          .status(400)
-          .json({
-            message:
-              "Parameters Missing: Both classId and date fields are required.",
-          });
+        return res.status(400).json({
+          message:
+            "Parameters Missing: Both classId and date fields are required.",
+        });
       }
 
       // 1. Upgraded Dynamic Year-Aware Security Guard (Preserved exactly)
@@ -173,12 +171,10 @@ class AttendanceController {
         });
 
         if (!validAssignment) {
-          return res
-            .status(403)
-            .json({
-              message:
-                "Access Denied: You are restricted from loading roster boundaries outside your assigned class.",
-            });
+          return res.status(403).json({
+            message:
+              "Access Denied: You are restricted from loading roster boundaries outside your assigned class.",
+          });
         }
       }
 
@@ -385,8 +381,8 @@ class AttendanceController {
       }));
 
       // 2. Commit historical mapping logs to the database using an atomic bulk operation
-       await AcademicYearStudent.bulkCreate(historicalMappings, {
-        updateOnDuplicate: ["classId", "updatedAt"]
+      await AcademicYearStudent.bulkCreate(historicalMappings, {
+        updateOnDuplicate: ["classId", "updatedAt"],
       });
 
       // 3. Update the active pointers on the User records to reflect their new class placement instantly
@@ -403,6 +399,40 @@ class AttendanceController {
       return res
         .status(500)
         .json({ message: `Promotion Engine Error: ${err.message}` });
+    }
+  }
+  async closeAcademicYear(req, res) {
+    try {
+      const { yearId } = req.params;
+      const instituteId = req.user.instituteId;
+      const { AcademicYear } = require("../models/index");
+
+      // Verify the targeted year exists and belongs to this school tenant
+      const targetYear = await AcademicYear.findOne({
+        where: { id: yearId, instituteId },
+      });
+      if (!targetYear) {
+        return res
+          .status(404)
+          .json({ message: "Educational calendar track not found." });
+      }
+
+      // Security Constraint Guard: Block locking if it is the currently active workspace cycle
+      if (targetYear.isActive) {
+        return res.status(400).json({
+          message:
+            "Constraint Wall: You cannot archive the primary active cycle directly. Please activate another year first to displace this track safely.",
+        });
+      }
+
+      // Commit the state mutation flag directly onto the row column
+      await targetYear.update({ isLocked: true });
+
+      return res.json({
+        message: `Academic cycle "${targetYear.name}" has been safely archived and locked to a read-only status.`,
+      });
+    } catch (err) {
+      return res.status(500).json({ message: err.message });
     }
   }
 }

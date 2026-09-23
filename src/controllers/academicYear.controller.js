@@ -20,12 +20,10 @@ class AcademicYearController {
     try {
       const { name, startDate, endDate } = req.body;
       if (!name || !startDate || !endDate) {
-        return res
-          .status(400)
-          .json({
-            message:
-              "Parameters Missing: Name, Start Date, and End Date are mandatory fields.",
-          });
+        return res.status(400).json({
+          message:
+            "Parameters Missing: Name, Start Date, and End Date are mandatory fields.",
+        });
       }
 
       const newYear = await AcademicYear.create({
@@ -36,12 +34,10 @@ class AcademicYearController {
         isActive: false, // Forces administrative verification step before toggling active indicators
       });
 
-      return res
-        .status(201)
-        .json({
-          message: "Academic cycle configuration logged successfully.",
-          data: newYear,
-        });
+      return res.status(201).json({
+        message: "Academic cycle configuration logged successfully.",
+        data: newYear,
+      });
     } catch (err) {
       return res.status(500).json({ message: err.message });
     }
@@ -65,11 +61,42 @@ class AcademicYearController {
         { where: { id, instituteId } },
       );
 
-      return res
-        .status(200)
-        .json({
-          message: "Educational processing cycle updated successfully.",
-        });
+      return res.status(200).json({
+        message: "Educational processing cycle updated successfully.",
+      });
+    } catch (err) {
+      return res.status(500).json({ message: err.message });
+    }
+  }
+  async closeAcademicYear(req, res) {
+    try {
+      const { yearId } = req.params;
+      const instituteId = req.user.instituteId;
+      const { AcademicYear } = require("../models/index");
+
+      const targetYear = await AcademicYear.findOne({
+        where: { id: yearId, instituteId },
+      });
+      if (!targetYear)
+        return res
+          .status(404)
+          .json({ message: "Educational calendar track not found." });
+
+      if (targetYear.isActive) {
+        return res
+          .status(400)
+          .json({
+            message:
+              "Constraint Wall: You cannot close the primary system active year directly. Please activate another year first to displace this track cleanly.",
+          });
+      }
+
+      // Mark status flags to prevent any further structural modifications
+      await targetYear.update({ isLocked: true });
+
+      return res.json({
+        message: `Academic cycle "${targetYear.name}" has been safely archived and locked.`,
+      });
     } catch (err) {
       return res.status(500).json({ message: err.message });
     }

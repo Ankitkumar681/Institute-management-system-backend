@@ -14,8 +14,9 @@ class AttendanceService {
   async markAttendance(data, actor) {
     const { studentId, date, status } = data;
     let { classId, academicYearId } = data;
+    const { AcademicYear, AcademicYearStudent } = require("../models/index");
 
-    // 🚀 STEP 1: If no explicit year context is provided, fall back safely onto the institute's active cycle
+    // 🚀 STEP 1: Fall back safely onto the institute's active cycle if no year context is specified
     if (!academicYearId && AcademicYear) {
       const activeYear = await AcademicYear.findOne({
         where: { instituteId: actor.instituteId, isActive: true },
@@ -23,15 +24,25 @@ class AttendanceService {
       if (activeYear) academicYearId = activeYear.id;
     }
 
-    // 🚀 STEP 2: TIMELINE OVERRIDE GATE
-    // Look up the accurate classroom assignment slot this student belonged to during THIS specific educational cycle!
-    if (academicYearId) {
-      const { AcademicYearStudent } = require("../models/index");
+    // 🚀 STEP 2: COLUMN-BASED LOCK GUARD
+    // Reads the newly added 'isLocked' database column flag directly
+    if (academicYearId && AcademicYear) {
+      const targetYear = await AcademicYear.findByPk(academicYearId);
+      if (targetYear && targetYear.isLocked) {
+        const lockError = new Error(
+          "Operational Blockade: This academic year track has been archived and locked. Attendance records for this cycle are read-only.",
+        );
+        lockError.statusCode = 400;
+        throw lockError;
+      }
+    }
+
+    // 🚀 STEP 3: TIMELINE OVERRIDE GATE
+    if (academicYearId && AcademicYearStudent) {
       const accuratePlacement = await AcademicYearStudent.findOne({
         where: { studentId, academicYearId, instituteId: actor.instituteId },
       });
 
-      // Override the destination classId to guarantee the log binds to Grade 10 for 2026 and Grade 9 for 2025 flawlessly!
       if (accuratePlacement) {
         classId = accuratePlacement.classId;
       }
@@ -42,14 +53,14 @@ class AttendanceService {
       instituteId: actor.instituteId,
       markedBy: actor.id,
       studentId,
-      classId: classId || data.classId, // Fallback onto form body variables safely
+      classId: classId || data.classId,
       date,
       status,
       academicYearId: academicYearId || null,
     });
   }
 
-  async markBulkAttendance(records, user) {
+  async markBulkAttendance(records, user, academicYearId = null) {
     if (!records || !Array.isArray(records)) {
       const error = new Error("Malformed bulk records collection parameters.");
       error.statusCode = 400;
@@ -57,16 +68,35 @@ class AttendanceService {
     }
 
     const { AcademicYear, AcademicYearStudent } = require("../models/index");
+    let targetYearId = academicYearId;
 
-    // Resolve current operational active cycle tracker properties
-    const activeYear = await AcademicYear.findOne({
-      where: { instituteId: user.instituteId, isActive: true },
-    });
+    if (
+      !targetYearId &&
+      targetYearId !== "0" &&
+      targetYearId !== "undefined" &&
+      AcademicYear
+    ) {
+      const activeYear = await AcademicYear.findOne({
+        where: { instituteId: user.instituteId, isActive: true },
+      });
+      if (activeYear) targetYearId = activeYear.id;
+    }
 
-    const targetYearId = activeYear ? activeYear.id : null;
+    // 🚀 STEP 2: COLUMN-BASED LOCK GUARD (BULK DESK)
+    // Rejects bulk overrides immediately if the database row flag reflects a locked cycle track
+    if (targetYearId && AcademicYear) {
+      const targetYear = await AcademicYear.findByPk(targetYearId);
+      if (targetYear && targetYear.isLocked) {
+        const lockError = new Error(
+          "Operational Blockade: This academic year track has been archived and locked. Attendance records for this cycle are read-only.",
+        );
+        lockError.statusCode = 400;
+        throw lockError;
+      }
+    }
+
     const formattedRecords = [];
 
-    // 🚀 STEP 3: Iterate and calculate timeline placement for every student row in the batch array loop
     for (const record of records) {
       let finalClassId = record.classId;
 
@@ -86,7 +116,7 @@ class AttendanceService {
       formattedRecords.push({
         id: require("crypto").randomUUID(),
         studentId: record.studentId,
-        classId: finalClassId, // Maps to their true year-isolated grade node seamlessly
+        classId: finalClassId,
         instituteId: user.instituteId,
         date: record.date,
         status: record.status,
@@ -94,12 +124,10 @@ class AttendanceService {
       });
     }
 
-    // Commit array batch rows directly using the Sequelize bulkCreate engine layer
     return await Attendance.bulkCreate(formattedRecords, {
       updateOnDuplicate: ["status", "classId", "academicYearId", "updatedAt"],
     });
   }
-
   async fetchAttendanceLogs(user, queryParameters = {}) {
     const {
       search,
@@ -242,62 +270,6 @@ class AttendanceService {
       role: "student",
       classId: classId,
       instituteId: instituteId,
-    });
-  }
-
-  // Inside src/services/attendance.service.js
-  async markBulkAttendance(records, user, academicYearId = null) {
-    if (!records || !Array.isArray(records)) {
-      const error = new Error("Malformed bulk records collection parameters.");
-      error.statusCode = 400;
-      throw error;
-    }
-
-    const { AcademicYear, AcademicYearStudent } = require("../models/index");
-    let targetYearId = academicYearId;
-
-    // Backward-Compatible Fallback: If no query string is passed, look up the primary active year
-    if (!targetYearId && targetYearId !== "0") {
-      const activeYear = await AcademicYear.findOne({
-        where: { instituteId: user.instituteId, isActive: true },
-      });
-      if (activeYear) targetYearId = activeYear.id;
-    }
-
-    const formattedRecords = [];
-
-    // Iterate and calculate correct year-scoped classroom allocations for every student in the batch
-    for (const record of records) {
-      let finalClassId = record.classId;
-
-      if (targetYearId && AcademicYearStudent) {
-        // 🚀 THE LOGIC FIX: Find the student's exact class for the SELECTED year context
-        const truePlacement = await AcademicYearStudent.findOne({
-          where: {
-            studentId: record.studentId,
-            academicYearId: targetYearId,
-            instituteId: user.instituteId,
-          },
-        });
-        if (truePlacement) {
-          finalClassId = truePlacement.classId;
-        }
-      }
-
-      formattedRecords.push({
-        id: require("crypto").randomUUID(),
-        studentId: record.studentId,
-        classId: finalClassId, // Safely maps to Grade-9 or Grade-10 based on selected context
-        instituteId: user.instituteId,
-        date: record.date,
-        status: record.status,
-        academicYearId: targetYearId,
-      });
-    }
-
-    // Commit batch rows directly into MySQL database
-    return await Attendance.bulkCreate(formattedRecords, {
-      updateOnDuplicate: ["status", "updatedAt"], // Updates cell status flags seamlessly on duplicates
     });
   }
 

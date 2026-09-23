@@ -45,5 +45,11 @@ router.post(
   attendanceController.promoteStudentsBulk
 );
 
+router.put(
+  '/academic-years/:yearId/close',
+  authMiddleware,
+  checkRole(['institute_admin']),
+  attendanceController.closeAcademicYear
+);
 
 module.exports = router;
