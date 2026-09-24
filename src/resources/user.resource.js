@@ -33,6 +33,19 @@ class UserResource {
             section: mappedClassroom.section,
           }
         : null,
+      profileExtension: user.profileExtension
+        ? {
+            parentName: user.profileExtension.parentName,
+            parentContact: user.profileExtension.parentContact,
+            parentEmail: user.profileExtension.parentEmail,
+            bloodGroup: user.profileExtension.bloodGroup,
+          }
+        : {
+            parentName: "Not Provided",
+            parentContact: "Not Provided",
+            parentEmail: null,
+            bloodGroup: "N/A",
+          },
       joinedAt: user.createdAt,
     };
   }

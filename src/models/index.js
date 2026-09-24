@@ -6,6 +6,7 @@ const Classroom = require('./Classroom');
 const AcademicYear = require('./AcademicYear');
 const AcademicYearStudent = require('./AcademicYearStudent');
 const AcademicYearStaff = require('./AcademicYearStaff');
+const StudentProfile = require('./StudentProfile');
 
 // ========================================================
 // DEFINE RELATIONSHIPS AND TARGET ALIASES SECURELY
@@ -70,6 +71,9 @@ User.hasMany(AcademicYearStaff, { foreignKey: 'teacherId', as: 'staffAssignments
 AcademicYearStaff.belongsTo(User, { foreignKey: 'teacherId', as: 'teacher' });
 AcademicYearStaff.belongsTo(Classroom, { foreignKey: 'classId', as: 'classroom' });
 
+User.hasOne(StudentProfile, { foreignKey: 'studentId', as: 'profileExtension', onDelete: 'CASCADE' });
+StudentProfile.belongsTo(User, { foreignKey: 'studentId', as: 'student' });
+
 module.exports = {
   sequelize,
   Institute,
@@ -78,5 +82,6 @@ module.exports = {
   Classroom,
   AcademicYear,
   AcademicYearStudent,
-  AcademicYearStaff
+  AcademicYearStaff,
+  StudentProfile
 };

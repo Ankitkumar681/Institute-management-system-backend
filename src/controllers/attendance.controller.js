@@ -435,6 +435,39 @@ class AttendanceController {
       return res.status(500).json({ message: err.message });
     }
   }
+  async dashboardTrends(req, res) {
+    try {
+      const { academicYearId = "" } = req.query;
+
+      // 🚀 THE SUPER ADMIN EXCEPTION: If a super_admin calls trends, aggregate system onboardings instead
+      if (req.user.role === "super_admin") {
+        const { Institute } = require("../models/index");
+        const sequelize = require("../config/db");
+
+        const schoolsByMonth = await Institute.findAll({
+          attributes: [
+            [sequelize.fn("MONTHNAME", sequelize.col("createdAt")), "month"],
+            [sequelize.fn("COUNT", sequelize.col("id")), "rate"], // Reusing rate column handle for easy frontend chart polymorphism
+          ],
+          group: [
+            sequelize.fn("MONTHNAME", sequelize.col("createdAt")),
+            sequelize.fn("MONTH", sequelize.col("createdAt")),
+          ],
+          order: [[sequelize.fn("MONTH", sequelize.col("createdAt")), "ASC"]],
+          raw: true,
+        });
+        return res.json(schoolsByMonth);
+      }
+
+      const dataTrend = await attendanceService.fetchAttendanceTrendMetrics(
+        req.user,
+        academicYearId,
+      );
+      return res.json(dataTrend);
+    } catch (err) {
+      return res.status(500).json({ message: err.message });
+    }
+  }
 }
 
 module.exports = new AttendanceController();

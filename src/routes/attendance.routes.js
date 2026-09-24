@@ -1,55 +1,75 @@
-const express = require('express');
-const attendanceController = require('../controllers/attendance.controller');
-const academicYearController = require('../controllers/academicYear.controller');
-const { authMiddleware, checkRole } = require('../middleware/auth.middleware');
+const express = require("express");
+const attendanceController = require("../controllers/attendance.controller");
+const academicYearController = require("../controllers/academicYear.controller");
+const { authMiddleware, checkRole } = require("../middleware/auth.middleware");
 
 // 🛠️ FIX: Initialize router using the express package instance
 const router = express.Router();
 
 router.post(
-  '/', 
-  authMiddleware, 
-  checkRole(['institute_admin', 'staff', 'class_teacher']), 
-  attendanceController.mark
+  "/",
+  authMiddleware,
+  checkRole(["institute_admin", "staff", "class_teacher"]),
+  attendanceController.mark,
 );
 
-router.get('/', authMiddleware, attendanceController.fetchLogs);
-router.get('/roster', authMiddleware, checkRole(['institute_admin', 'staff', 'class_teacher']), attendanceController.fetchClassRoster);
-router.post('/bulk', authMiddleware, checkRole(['institute_admin', 'staff', 'class_teacher']), attendanceController.markBulk);
-router.get('/export', authMiddleware, attendanceController.exportCSV);
-router.get('/export-pdf', authMiddleware, attendanceController.exportPDF)
-router.get('/dashboard-analytics', checkRole(['institute_admin', 'staff', 'class_teacher']), attendanceController.fetchDashboardAnalytics);
+router.get("/", authMiddleware, attendanceController.fetchLogs);
 router.get(
-  '/academic-years', 
-  authMiddleware, 
-  academicYearController.fetchYears
+  "/roster",
+  authMiddleware,
+  checkRole(["institute_admin", "staff", "class_teacher"]),
+  attendanceController.fetchClassRoster,
+);
+router.post(
+  "/bulk",
+  authMiddleware,
+  checkRole(["institute_admin", "staff", "class_teacher"]),
+  attendanceController.markBulk,
+);
+router.get("/export", authMiddleware, attendanceController.exportCSV);
+router.get("/export-pdf", authMiddleware, attendanceController.exportPDF);
+router.get(
+  "/dashboard-analytics",
+  checkRole(["institute_admin", "staff", "class_teacher"]),
+  attendanceController.fetchDashboardAnalytics,
+);
+router.get(
+  "/academic-years",
+  authMiddleware,
+  academicYearController.fetchYears,
 );
 
 router.post(
-  '/academic-years', 
-  authMiddleware, 
-  checkRole(['institute_admin']), 
-  academicYearController.createYear
+  "/academic-years",
+  authMiddleware,
+  checkRole(["institute_admin"]),
+  academicYearController.createYear,
 );
 
 router.patch(
-  '/academic-years/:id/activate', 
-  authMiddleware, 
-  checkRole(['institute_admin']), 
-  academicYearController.setActiveYear
+  "/academic-years/:id/activate",
+  authMiddleware,
+  checkRole(["institute_admin"]),
+  academicYearController.setActiveYear,
 );
 router.post(
-  '/promote-students', 
-  authMiddleware, 
-  checkRole(['institute_admin']), 
-  attendanceController.promoteStudentsBulk
+  "/promote-students",
+  authMiddleware,
+  checkRole(["institute_admin"]),
+  attendanceController.promoteStudentsBulk,
 );
 
 router.put(
-  '/academic-years/:yearId/close',
+  "/academic-years/:yearId/close",
   authMiddleware,
-  checkRole(['institute_admin']),
-  attendanceController.closeAcademicYear
+  checkRole(["institute_admin"]),
+  attendanceController.closeAcademicYear,
+);
+router.get(
+  "/dashboard-trend",
+  authMiddleware,
+  checkRole(["institute_admin", "super_admin", "class_teacher"]),
+  attendanceController.dashboardTrends,
 );
 
 module.exports = router;

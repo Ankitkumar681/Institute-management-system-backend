@@ -478,6 +478,108 @@ class AttendanceService {
 
     return { logs, classroom };
   }
+  async fetchAttendanceTrendMetrics(user, academicYearId = "") {
+    const {
+      Attendance,
+      AcademicYearStaff,
+      AcademicYear,
+    } = require("../models/index");
+    const sequelize = require("../config/db");
+    const { Op } = require("sequelize");
+    const instituteId = user.instituteId;
+
+    // 1. Resolve Target Academic Year Context Fallback
+    let targetYearId = academicYearId;
+    if (!targetYearId && targetYearId !== "0" && targetYearId !== "undefined") {
+      const activeYear = await AcademicYear.findOne({
+        where: { instituteId, isActive: true },
+      });
+      if (activeYear) targetYearId = activeYear.id;
+    }
+
+    // 2. Build Base Filtering Matrices
+    let whereCondition = { instituteId };
+    if (targetYearId) {
+      whereCondition.academicYearId = targetYearId;
+    }
+
+    // 🔒 THE CLASS TEACHER SECURITY GUARD: Restrict data query strictly to their assigned classes
+    if (user.role === "class_teacher") {
+      const activeAssignments = await AcademicYearStaff.findAll({
+        where: {
+          teacherId: user.id,
+          instituteId,
+          ...(targetYearId && { academicYearId: targetYearId }),
+        },
+        attributes: ["classId"],
+        raw: true,
+      });
+      const assignedClassIds = activeAssignments.map((a) => a.classId);
+      whereCondition.classId = {
+        [Op.in]:
+          assignedClassIds.length > 0 ? assignedClassIds : ["_FORCE_EMPTY_"],
+      };
+    }
+
+    // 3. Query and group records by Month via Sequelize Raw Attributes Aggregations
+    const monthlyStats = await Attendance.findAll({
+      where: whereCondition,
+      attributes: [
+        [sequelize.fn("MONTHNAME", sequelize.col("date")), "monthName"],
+        [sequelize.fn("MONTH", sequelize.col("date")), "monthNumber"],
+        [sequelize.fn("COUNT", sequelize.col("id")), "totalLogs"],
+        [
+          sequelize.literal(
+            "SUM(CASE WHEN status = 'Present' OR status = 'Late' THEN 1 ELSE 0 END)",
+          ),
+          "presentCount",
+        ],
+      ],
+      group: [
+        sequelize.fn("MONTHNAME", sequelize.col("date")),
+        sequelize.fn("MONTH", sequelize.col("date")),
+      ],
+      order: [[sequelize.fn("MONTH", sequelize.col("date")), "ASC"]],
+      raw: true,
+    });
+
+    // 4. Map, structure, and format response array cleanly for frontend charts
+    const chronologicalMonths = [
+      "January",
+      "February",
+      "March",
+      "April",
+      "May",
+      "June",
+      "July",
+      "August",
+      "September",
+      "October",
+      "November",
+      "December",
+    ];
+
+    // Seed an empty trend matrix baseline
+    const trendMap = {};
+    chronologicalMonths.forEach((m) => {
+      trendMap[m] = { month: m, rate: 0, logs: 0 };
+    });
+
+    monthlyStats.forEach((row) => {
+      const name = row.monthName;
+      const logs = parseInt(row.totalLogs) || 0;
+      const present = parseInt(row.presentCount) || 0;
+      const calculatedRate = logs > 0 ? Math.round((present / logs) * 100) : 0;
+
+      if (trendMap[name]) {
+        trendMap[name].rate = calculatedRate;
+        trendMap[name].logs = logs;
+      }
+    });
+
+    // Return a clean flat array list sorted from January to December
+    return chronologicalMonths.map((m) => trendMap[m]);
+  }
 }
 
 module.exports = new AttendanceService();

@@ -16,5 +16,6 @@ router.post(
   upload.single('file'),
   authController.importStudentsCSV
 );
-
+router.put('/students/:studentId', checkRole(['institute_admin']), authController.updateStudentInline);
+router.put('/students/:studentId/profile', checkRole(['institute_admin']), authController.updateStudentProfileExtension);
 module.exports = router;

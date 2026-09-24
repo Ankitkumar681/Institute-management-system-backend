@@ -132,9 +132,53 @@ class AuthController {
         filterContext,
         { sortBy, sortOrder, page, limit },
       );
+
+      // 🚀 THE SELF-HEALING SEED PIPELINE:
+      // Loop through the raw records. If an older student doesn't have an extension row, create a default one!
+      const { StudentProfile } = require("../models/index");
+      const crypto = require("crypto");
+
+      if (result.records && result.records.length > 0) {
+        for (const userInstance of result.records) {
+          if (
+            userInstance.role === "student" &&
+            !userInstance.profileExtension
+          ) {
+            const [newProfile] = await StudentProfile.findOrCreate({
+              where: { studentId: userInstance.id },
+              defaults: {
+                id: crypto.randomUUID(),
+                studentId: userInstance.id,
+                parentName: "Not Provided",
+                parentContact: "Not Provided",
+                parentEmail: null,
+                bloodGroup: "N/A",
+              },
+            });
+            // Force link the instance row inside memory
+            userInstance.profileExtension = newProfile;
+          }
+        }
+      }
+
+      const plainRecords = result.records.map((record) => {
+        const rawJson = record.toJSON ? record.toJSON() : record;
+        return {
+          ...rawJson,
+          // Explicitly map profileExtension property to guarantee it reaches the network wire
+          profileExtension: rawJson.profileExtension || {
+            parentName: "Not Provided",
+            parentContact: "Not Provided",
+            parentEmail: null,
+            bloodGroup: "N/A",
+          },
+          joinedAt: rawJson.createdAt,
+        };
+      });
+
       return res.json({
         ...result,
-        records: UserResource.collection(result.records),
+        records: plainRecords, 
       });
     } catch (err) {
       return res.status(500).json({ message: err.message });
@@ -289,6 +333,125 @@ class AuthController {
       return res.status(200).json({
         message: `Successfully onboarded ${result.totalImported} student profiles for this selected year context cycle.`,
         data: result,
+      });
+    } catch (err) {
+      return res.status(500).json({ message: err.message });
+    }
+  }
+  async updateStudentInline(req, res) {
+    try {
+      const { studentId } = req.params;
+      const { name, email, classId, academicYearId } = req.body;
+      const instituteId = req.user.instituteId;
+
+      const { User, AcademicYearStudent } = require("../models/index");
+
+      // 1. Locate student footprint profile
+      const student = await User.findOne({
+        where: { id: studentId, instituteId, role: "student" },
+      });
+      if (!student)
+        return res.status(404).json({ message: "Student record not found." });
+
+      // 2. Mutate global core user parameters
+      await student.update({
+        name: name || student.name,
+        email: email ? email.trim().toLowerCase() : student.email,
+        classId: classId || student.classId,
+      });
+
+      // 3. 🚀 MULTI-YEAR ENGINE TIMELINE SYNC: Update their historical classroom placement row for this year
+      if (academicYearId) {
+        const activePlacement = await AcademicYearStudent.findOne({
+          where: { studentId, academicYearId, instituteId },
+        });
+
+        if (activePlacement) {
+          await activePlacement.update({
+            classId: classId || activePlacement.classId,
+          });
+        }
+      }
+
+      return res.json({
+        message: "Student information profile synchronized successfully.",
+      });
+    } catch (err) {
+      return res.status(500).json({ message: err.message });
+    }
+  }
+  async updateStudentProfileExtension(req, res) {
+    try {
+      const { studentId } = req.params;
+      const {
+        name,
+        email,
+        classId,
+        academicYearId,
+        parentName,
+        parentContact,
+        parentEmail,
+        bloodGroup,
+      } = req.body;
+      const instituteId = req.user.instituteId;
+
+      const {
+        User,
+        AcademicYearStudent,
+        StudentProfile,
+      } = require("../models/index");
+
+      // 1. Locate student user profile
+      const student = await User.findOne({
+        where: { id: studentId, instituteId, role: "student" },
+      });
+      if (!student)
+        return res.status(404).json({ message: "Student record not found." });
+
+      // 2. Mutate global core user parameters
+      await student.update({
+        name: name || student.name,
+        email: email ? email.trim().toLowerCase() : student.email,
+        classId: classId || student.classId,
+      });
+
+      // 3. 🚀 MULTI-YEAR ENGINE TIMELINE SYNC: Update their historical classroom placement row for this year
+      if (academicYearId && AcademicYearStudent) {
+        const activePlacement = await AcademicYearStudent.findOne({
+          where: { studentId, academicYearId, instituteId },
+        });
+        if (activePlacement) {
+          await activePlacement.update({
+            classId: classId || activePlacement.classId,
+          });
+        }
+      }
+
+      // 4. 🚀 EXTENSION LEDGER UPSERT: Sync parental metadata properties fields cleanly
+      if (StudentProfile) {
+        const profile = await StudentProfile.findOne({ where: { studentId } });
+        if (profile) {
+          await profile.update({
+            parentName: parentName || profile.parentName,
+            parentContact: parentContact || profile.parentContact,
+            parentEmail:
+              parentEmail !== undefined ? parentEmail : profile.parentEmail,
+            bloodGroup: bloodGroup || profile.bloodGroup,
+          });
+        } else {
+          await StudentProfile.create({
+            id: require("crypto").randomUUID(),
+            studentId,
+            parentName: parentName || "Not Provided",
+            parentContact: parentContact || "Not Provided",
+            parentEmail: parentEmail || null,
+            bloodGroup: bloodGroup || "N/A",
+          });
+        }
+      }
+
+      return res.json({
+        message: "Student profile extensions updated successfully.",
       });
     } catch (err) {
       return res.status(500).json({ message: err.message });

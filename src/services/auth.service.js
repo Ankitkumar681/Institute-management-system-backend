@@ -8,6 +8,9 @@ class AuthService {
   async registerUser(data) {
     const { name, email, password, role, academicYearId } = data;
     const cleanEmail = email.trim().toLowerCase();
+    const models = require("../models/index");
+    const { AcademicYearStudent, StudentProfile, User } = models;
+    const crypto = require("crypto");
 
     // 🚀 STEP 1: Find if a user footprint already exists with this email address
     const existingUser = await userRepository.findByEmail(cleanEmail);
@@ -17,9 +20,7 @@ class AuthService {
       if (role !== "student" || existingUser.role !== "student") {
         throw Object.assign(
           new Error("Email already exists across system staff directories"),
-          {
-            statusCode: 400,
-          },
+          { statusCode: 400 },
         );
       }
 
@@ -27,10 +28,33 @@ class AuthService {
       // 🚀 MULTI-YEAR CROSSOVER ENROLLMENT (Non-Breaking Promotion Route)
       // ========================================================================
       // The student is already a user! We just link them to the new year roster.
-      const models = require("../models/index");
-      const AcademicYearStudent = models.AcademicYearStudent;
-
       if (AcademicYearStudent && data.classId && academicYearId) {
+        // 🚀 THE PROFILE RE-ONBOARD EXTENSION UPSERT HOOK:
+        // Update parental information parameters natively if changes are passed down in the form body
+        if (StudentProfile) {
+          const existingProfile = await StudentProfile.findOne({
+            where: { studentId: existingUser.id },
+          });
+          if (existingProfile) {
+            await existingProfile.update({
+              parentName: data.parentName || existingProfile.parentName,
+              parentContact:
+                data.parentContact || existingProfile.parentContact,
+              parentEmail: data.parentEmail || existingProfile.parentEmail,
+              bloodGroup: data.bloodGroup || existingProfile.bloodGroup,
+            });
+          } else {
+            await StudentProfile.create({
+              id: crypto.randomUUID(),
+              studentId: existingUser.id,
+              parentName: data.parentName || "Not Provided",
+              parentContact: data.parentContact || "Not Provided",
+              parentEmail: data.parentEmail || null,
+              bloodGroup: data.bloodGroup || "N/A",
+            });
+          }
+        }
+
         // Prevent duplicate junction enrollment seeds within the SAME active year frame
         const alreadyLinked = await AcademicYearStudent.findOne({
           where: {
@@ -53,7 +77,7 @@ class AuthService {
 
         // 1. Provision a new history roadmap node row entry natively
         await AcademicYearStudent.create({
-          id: require("crypto").randomUUID(),
+          id: crypto.randomUUID(),
           instituteId: data.instituteId,
           academicYearId: academicYearId,
           studentId: existingUser.id,
@@ -71,11 +95,13 @@ class AuthService {
     }
 
     // ========================================================================
-    // STEP 2: Standard Freshman Enrollment Flow (Runs only if email is brand new)
+    // 🚀 STEP 2: Standard Freshman Enrollment Flow (Runs only if email is brand new)
     // ========================================================================
+    const bcrypt = require("bcrypt");
     const hashedPassword = await bcrypt.hash(password, 10);
 
     if (role === "institute_admin") {
+      const { Institute, sequelize } = models;
       const t = await sequelize.transaction();
       try {
         const newInstitute = await Institute.create(
@@ -84,6 +110,7 @@ class AuthService {
         );
         const newAdmin = await User.create(
           {
+            id: crypto.randomUUID(),
             name,
             email: cleanEmail,
             password: hashedPassword,
@@ -101,7 +128,9 @@ class AuthService {
       }
     }
 
+    // Standard profile user account entity creation step
     const newUser = await User.create({
+      id: crypto.randomUUID(),
       name,
       email: cleanEmail,
       password: hashedPassword,
@@ -110,15 +139,31 @@ class AuthService {
       classId: data.classId || null,
     });
 
+    // 🚀 THE FRESHMAN PROFILE CHILD ROW ENTRY SEED
+    if (role === "student" && StudentProfile) {
+      try {
+        await StudentProfile.create({
+          id: crypto.randomUUID(),
+          studentId: newUser.id,
+          parentName: data.parentName || "Not Provided",
+          parentContact: data.parentContact || "Not Provided",
+          parentEmail: data.parentEmail || null,
+          bloodGroup: data.bloodGroup || "N/A",
+        });
+      } catch (profileErr) {
+        console.error(
+          "Critical Profile attachment generation failed: ",
+          profileErr.message,
+        );
+      }
+    }
+
     // Seed initial freshman year timeline maps
     if (role === "student" && data.classId && academicYearId) {
       try {
-        const models = require("../models/index");
-        const AcademicYearStudent = models.AcademicYearStudent;
-
         if (AcademicYearStudent) {
           await AcademicYearStudent.create({
-            id: require("crypto").randomUUID(),
+            id: crypto.randomUUID(),
             instituteId: data.instituteId,
             academicYearId: academicYearId,
             studentId: newUser.id,
@@ -135,6 +180,7 @@ class AuthService {
 
     return newUser;
   }
+
   async loginUser(body) {
     const { email, password } = body;
 
@@ -350,14 +396,21 @@ class AuthService {
         "Parameters Missing: Both Class selection and Academic Year context are required.",
       );
     }
-    const { User, AcademicYearStudent } = require("../models/index");
 
-    if (!AcademicYearStudent) {
+    // Ensure models are destructured using your exact definitions matching models/index.js
+    const {
+      User,
+      AcademicYearStudent,
+      StudentProfile,
+    } = require("../models/index");
+
+    if (!AcademicYearStudent || !StudentProfile) {
       throw new Error(
-        "Infrastructure Error: AcademicYearStudent model could not be verified inside database schema contexts.",
+        "Infrastructure Error: Required profile timeline or student extension schemas could not be verified.",
       );
     }
-    // Convert raw spreadsheet file byte buffers into clear readable lines string arrays
+
+    // Convert raw spreadsheet file byte buffers into clear readable strings
     const fileContent = fileBuffer.toString("utf8");
     const rows = fileContent
       .split(/\r?\n/)
@@ -368,19 +421,27 @@ class AuthService {
         "The uploaded CSV spreadsheet file contains no student record rows.",
       );
 
-    // Parse header rows indexes (Expected format columns: Name, Email, TemporaryPassword)
     const recordsEnrolled = [];
-    const defaultHashedPassword = await bcrypt.hash("Student@123", 10); // Standard temporary login credential code
+    const bcrypt = require("bcrypt");
+    const crypto = require("crypto");
+    const defaultHashedPassword = await bcrypt.hash("Student@123", 10);
 
     // Loop through row entries skipping column headers line index 0
     for (let i = 1; i < rows.length; i++) {
+      // Split by comma and strip quotes out safely
       const columns = rows[i]
         .split(",")
         .map((cell) => cell.trim().replace(/^["']|["']$/g, ""));
-      if (columns.length < 2 || !columns[0] || !columns[1]) continue; // Skip incomplete blank rows
+      if (!columns[0] || !columns[1]) continue; // Skip incomplete or empty rows
 
       const studentName = columns[0];
       const studentEmail = columns[1].toLowerCase();
+
+      // 🚀 EXTRACT EXTRA CSV COLUMNS (Expected Order: Name, Email, ParentName, ParentContact, ParentEmail, BloodGroup)
+      const parentName = columns[2] || "Not Provided";
+      const parentContact = columns[3] || "Not Provided";
+      const parentEmail = columns[4] || null;
+      const bloodGroup = columns[5] || "N/A";
 
       // Check if user account email exists globally first to map duplicates gracefully
       let studentUser = await User.findOne({ where: { email: studentEmail } });
@@ -400,7 +461,32 @@ class AuthService {
         await studentUser.update({ classId: targetClassId });
       }
 
-      // Check for or provision history timeline ledger junction table links
+      // 🚀 THE PROFILE EXTENSION UPSERT CIRCUIT
+      // Dynamically seeds or refreshes the 1:1 parent information ledger row for this student
+      const existingProfile = await StudentProfile.findOne({
+        where: { studentId: studentUser.id },
+      });
+      if (existingProfile) {
+        await existingProfile.update({
+          parentName: columns[2] ? parentName : existingProfile.parentName,
+          parentContact: columns[3]
+            ? parentContact
+            : existingProfile.parentContact,
+          parentEmail: columns[4] ? parentEmail : existingProfile.parentEmail,
+          bloodGroup: columns[5] ? bloodGroup : existingProfile.bloodGroup,
+        });
+      } else {
+        await StudentProfile.create({
+          id: crypto.randomUUID(),
+          studentId: studentUser.id,
+          parentName,
+          parentContact,
+          parentEmail,
+          bloodGroup,
+        });
+      }
+
+      // The Year-Scoped Junction Entry lookup check
       const alreadyMapped = await AcademicYearStudent.findOne({
         where: {
           academicYearId: targetAcademicYearId,

@@ -12,6 +12,7 @@ const classroomRoutes = require('./routes/classroom.routes');
 const instituteRoutes = require('./routes/institute.routes');
 const checkTenantStatus = require('./middleware/tenantCheck.middleware');
 const { authMiddleware } = require('./middleware/auth.middleware');
+const yearLockGuard = require('./middleware/yearLockGuard.middleware');
 
 const app = express();
 
@@ -24,6 +25,7 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 app.use(checkTenantStatus);
 app.use(authMiddleware);
+app.use('/api', yearLockGuard);
 app.use('/api/users', userRoutes); 
 app.use('/api/attendance', attendanceRoutes);
 app.use('/api/classrooms', classroomRoutes);

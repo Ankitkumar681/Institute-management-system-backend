@@ -25,4 +25,4 @@ const Institute = sequelize.define('Institute', {
   timestamps: true
 });
 
-module.exports = Institute;
+module.exports = Institute; 

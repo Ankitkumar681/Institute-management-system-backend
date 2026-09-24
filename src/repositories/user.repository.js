@@ -1,5 +1,10 @@
 const BaseRepository = require("./base.repository");
-const { User, Classroom, AcademicYearStudent } = require("../models/index"); // ⚡ Import from unified context index
+const {
+  User,
+  Classroom,
+  AcademicYearStudent,
+  StudentProfile,
+} = require("../models/index");
 const { Op } = require("sequelize");
 
 class UserRepository extends BaseRepository {
@@ -82,6 +87,18 @@ class UserRepository extends BaseRepository {
         attributes: ["id", "name", "section"],
       },
     ];
+    if (role === "student" && StudentProfile) {
+      inclusionModels.push({
+        model: StudentProfile,
+        as: "profileExtension",
+        attributes: [
+          "parentName",
+          "parentContact",
+          "parentEmail",
+          "bloodGroup",
+        ],
+      });
+    }
 
     if (isHistoricalStudentQuery && AcademicYearStudent) {
       try {
