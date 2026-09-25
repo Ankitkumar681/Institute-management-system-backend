@@ -33,48 +33,48 @@ class ClassroomService {
       ],
     });
   }
-  async getPaginatedClassrooms(instituteId, params) {
-    const { search, page = 1, limit = 5, academicYearId } = params;
-    const offset = (parseInt(page) - 1) * parseInt(limit);
+   async getPaginatedClassrooms(instituteId, filters) {
+    const { Classroom } = require("../models/index");
+    const { Op } = require("sequelize");
 
+    // 1. Set baseline query criteria
     let whereCondition = { instituteId };
-    if (search && search.trim() !== "") {
-      whereCondition.name = { [Op.like]: `%${search.trim()}%` };
+
+    if (filters.academicYearId && filters.academicYearId !== "all") {
+      whereCondition.academicYearId = filters.academicYearId;
     }
-    if (
-      academicYearId &&
-      academicYearId !== "" &&
-      academicYearId !== "undefined"
-    ) {
-      whereCondition.academicYearId = academicYearId;
+
+    if (filters.search && String(filters.search).trim().length > 0) {
+      whereCondition.name = { [Op.like]: `%${String(filters.search).trim()}%` };
     }
-    if (params.classId) {
-      whereCondition.id = params.classId; // Forces the grid layout to only query this matched room entry row
+
+    // ========================================================================
+    // 🚀 FIXED: ENFORCE THE CLASSROOM ID MATRIX CONTAINMENT BOUNDARY
+    // ========================================================================
+    // If the controller specifies a limited list of authorized classes, 
+    // strictly limit the database response rows to this array pool!
+    if (filters.classIds && Array.isArray(filters.classIds)) {
+      whereCondition.id = { [Op.in]: filters.classIds };
+    } else if (filters.classId) {
+      whereCondition.id = filters.classId;
     }
-    if (limit === "all") {
-      const rows = await Classroom.findAll({
-        where: whereCondition,
-        order: [["createdAt", "DESC"]],
-      });
-      return {
-        totalRecords: rows.length,
-        totalPages: 1,
-        currentPage: 1,
-        limit: rows.length,
-        records: rows,
-      };
-    }
+
+    // 2. Execute query execution mapping
+    const page = parseInt(filters.page) || 1;
+    const limit = filters.limit === "all" ? null : (parseInt(filters.limit) || 5);
+    const offset = filters.limit === "all" ? null : (page - 1) * limit;
+
     const { count, rows } = await Classroom.findAndCountAll({
       where: whereCondition,
-      limit: parseInt(limit),
-      offset: offset,
-      order: [["createdAt", "DESC"]],
+      limit,
+      offset,
+      order: [["name", "ASC"], ["section", "ASC"]],
     });
+
     return {
       totalRecords: count,
-      totalPages: Math.ceil(count / limit) || 1,
-      currentPage: parseInt(page),
-      limit: parseInt(limit),
+      totalPages: limit ? Math.ceil(count / limit) : 1,
+      currentPage: page,
       records: rows,
     };
   }

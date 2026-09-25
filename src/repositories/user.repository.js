@@ -110,7 +110,6 @@ class UserRepository extends BaseRepository {
         if (classId) {
           timelineFilter.classId = classId;
         }
-
         const matchingTimelineRecords = await AcademicYearStudent.findAll({
           where: timelineFilter,
           attributes: ["studentId"],
@@ -129,8 +128,6 @@ class UserRepository extends BaseRepository {
               : ["_FORCE_EMPTY_RESULT_"],
         };
 
-        // 🚀 THE TIMELINE CONTEXT JUMP HOOK: Inner join the placement mapping row for this year
-        // carrying its historical year-specific classroom row reference block!
         inclusionModels.push({
           model: AcademicYearStudent,
           as: "yearlyEnrollments", // ⚡ Assumes User.hasMany(AcademicYearStudent, { as: "yearPlacements" }) exists in models/index.js

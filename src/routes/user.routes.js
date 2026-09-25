@@ -11,6 +11,7 @@ router.get('/students', checkRole(['super_admin', 'institute_admin', 'admin', 's
 router.get('/staff', checkRole(['super_admin', 'institute_admin', 'admin']), authController.listStaff);
 router.put('/staff/:id/status', checkRole(['institute_admin']), authController.toggleStaffStatus);
 router.put('/staff/assign-class', checkRole(['institute_admin']), authController.assignTeacherClass);
+router.delete('/staff/subjects/:assignmentId', checkRole(['institute_admin']), authController.revokeSubjectAssignment);
 router.post(
   '/students/bulk-import',
   upload.single('file'),

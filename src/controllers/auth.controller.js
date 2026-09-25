@@ -2,6 +2,7 @@ const authService = require("../services/auth.service");
 const UserResource = require("../resources/user.resource");
 const userRepository = require("../repositories/user.repository");
 const { User } = require("../models/index");
+const { Op } = require("sequelize");
 
 class AuthController {
   async register(req, res) {
@@ -36,26 +37,32 @@ class AuthController {
         page = 1,
         limit = 5,
         academicYearId,
-      } = req.query; // 🚀 Capture year query params
+      } = req.query;
       const targetInstituteId = req.user.instituteId;
 
-      const { User, Classroom, AcademicYearStaff } = require("../models/index");
-      const { Op } = require("sequelize");
+      const {
+        User,
+        Classroom,
+        AcademicYearStaff,
+        AcademicYearTeacher,
+      } = require("../models/index");
       const offset = (parseInt(page) - 1) * parseInt(limit);
 
+      // 🚀 UPGRADED: Include all faculty role variations in the query search
       let whereCondition = {
-        role: "class_teacher",
+        role: { [Op.in]: ["class_teacher", "teacher", "staff"] },
         instituteId: targetInstituteId,
       };
       if (search) {
         whereCondition.name = { [Op.like]: `%${String(search).trim()}%` };
       }
 
-      // Pull faculty members along with their year-scoped assignment allocations rows
+      // Pull faculty members along with both primary and subject assignments
       const { count, rows } = await User.findAndCountAll({
         where: whereCondition,
         limit: limit === "all" ? null : parseInt(limit),
         offset: limit === "all" ? null : offset,
+        distinct: true,
         include: [
           {
             model: AcademicYearStaff,
@@ -70,27 +77,53 @@ class AuthController {
               },
             ],
           },
+          {
+            model: AcademicYearTeacher,
+            as: "subjectAssignments",
+            where: academicYearId ? { academicYearId } : {},
+            required: false,
+            include: [
+              {
+                model: Classroom,
+                as: "classroom",
+                attributes: ["id", "name", "section"],
+              },
+            ],
+          },
         ],
         order: [[sortBy, sortOrder]],
       });
 
-      // Format response cleanly so the frontend sees the correct classroom object based on the timeline choice
+      // Format response so the frontend maps primary slots and subject-classes array lists perfectly
       const records = rows.map((user) => {
+        const plainUser = user.get({ plain: true });
         const activeAssignment =
-          user.staffAssignments && user.staffAssignments[0];
+          plainUser.staffAssignments && plainUser.staffAssignments.length > 0
+            ? plainUser.staffAssignments[0]
+            : null;
         return {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          status: user.status,
+          id: plainUser.id,
+          name: plainUser.name,
+          email: plainUser.email,
+          role: plainUser.role,
+          status: plainUser.status,
+          // Primary class assignment (Object or null)
           classroom: activeAssignment ? activeAssignment.classroom : null,
+          // 🚀 NEW: Array of multi-class subject assignments
+          subjects:
+            plainUser.subjectAssignments?.map((s) => ({
+              assignmentId: s.id,
+              classId: s.classroom?.id,
+              className: s.classroom?.name,
+              section: s.classroom?.section,
+              subjectName: s.subjectName,
+            })) || [],
         };
       });
 
       return res.json({
         totalRecords: count,
-        totalPages: Math.ceil(count / limit) || 1,
+        totalPages: limit === "all" ? 1 : Math.ceil(count / limit) || 1,
         currentPage: parseInt(page),
         records,
       });
@@ -110,6 +143,7 @@ class AuthController {
         limit = 5,
         academicYearId,
       } = req.query;
+
       const filterContext = {
         role: "student",
         instituteId: req.user.instituteId,
@@ -120,6 +154,7 @@ class AuthController {
       if (classId && classId !== "" && classId !== "undefined") {
         filterContext.classId = classId;
       }
+
       if (
         academicYearId &&
         academicYearId !== "" &&
@@ -178,7 +213,7 @@ class AuthController {
 
       return res.json({
         ...result,
-        records: plainRecords, 
+        records: plainRecords,
       });
     } catch (err) {
       return res.status(500).json({ message: err.message });
@@ -222,56 +257,157 @@ class AuthController {
     }
   }
   async assignTeacherClass(req, res) {
+    const {
+      sequelize,
+      AcademicYearStaff,
+      AcademicYearTeacher,
+    } = require("../models/index");
+    const t = await sequelize.transaction();
     try {
-      const { teacherId, classId, academicYearId } = req.body; // 🚀 NEW: Extracted year choice from body parameters
+      const {
+        teacherId,
+        classId,
+        academicYearId,
+        subjectName,
+        makePrimaryClassTeacher,
+        roleOverride,
+      } = req.body;
       const instituteId = req.user.instituteId;
-
       if (!academicYearId) {
+        await t.rollback();
         return res.status(400).json({
           message: "Parameters Missing: academicYearId context is required.",
         });
       }
 
-      // 1. Verify the targeted teacher exists and belongs to this school tenant branch
-      const teacher = await userRepository.findOne({
-        id: teacherId,
-        instituteId,
-        role: "class_teacher",
+      // 1. Locate the target teacher across expanded matching role profiles
+      const teacher = await User.findOne({
+        where: {
+          id: teacherId,
+          instituteId,
+          role: { [Op.in]: ["class_teacher", "teacher", "staff"] },
+        },
       });
-      if (!teacher)
+      if (!teacher) {
+        await t.rollback();
         return res
           .status(404)
           .json({ message: "Teacher record not found in this institute." });
-
-      const { AcademicYearStaff } = require("../models/index");
-      const crypto = require("crypto");
-
-      // 2. Clear out any existing assignment row for this teacher inside THIS specific year session block
-      await AcademicYearStaff.destroy({
-        where: { teacherId, academicYearId, instituteId },
-      });
-
-      // 3. If a new classId allocation link is provided, create the timeline record row entry block
-      if (classId && classId !== "" && classId !== "undefined") {
-        await AcademicYearStaff.create({
-          id: crypto.randomUUID(),
-          instituteId,
-          academicYearId,
-          teacherId,
-          classId,
-        });
-
-        // Soft Fallback: Keep current active user column updated for real-time legacy checks if needed
-        await teacher.update({ classId });
-      } else {
-        await teacher.update({ classId: null });
       }
 
+      const crypto = require("crypto");
+
+      // 2. Process structural profile tier conversions if passed from UI controls
+      if (
+        roleOverride &&
+        ["class_teacher", "teacher", "staff"].includes(roleOverride)
+      ) {
+        await teacher.update({ role: roleOverride }, { transaction: t });
+      }
+
+      // 3. 🛡️ TRACK A: Map Primary Class Teacher Accountability
+      if (classId && classId !== "undefined" && classId !== "") {
+        if (makePrimaryClassTeacher === true) {
+          await AcademicYearStaff.destroy({
+            where: { classId, academicYearId, instituteId },
+            transaction: t,
+          });
+
+          // 🚀 FIX B: Clean up this specific teacher's other primary slots for this year track cycle
+          // A teacher can only be a primary class teacher for ONE class per academic cycle!
+          await AcademicYearStaff.destroy({
+            where: { teacherId, academicYearId, instituteId },
+            transaction: t,
+          });
+
+          // Force upgrade core role context flag cleanly
+          await teacher.update(
+            { role: "class_teacher", classId },
+            { transaction: t },
+          );
+
+          // Set the new primary holder row mapping context
+          await AcademicYearStaff.create(
+            {
+              id: crypto.randomUUID(),
+              instituteId,
+              academicYearId,
+              teacherId,
+              classId,
+            },
+            { transaction: t },
+          );
+        } else {
+          // ==========================================
+          // UNCHECKED / UNASSIGN PROCESS LOOP
+          // ==========================================
+          // If they were previously mapped to this class, clear the primary slot link
+          const wasClassTeacher = await AcademicYearStaff.findOne({
+            where: { classId, teacherId, academicYearId, instituteId },
+            transaction: t,
+          });
+
+          if (wasClassTeacher) {
+            await wasClassTeacher.destroy({ transaction: t });
+
+            // Demote to a regular teacher role and nullify their core class pointer
+            await teacher.update(
+              {
+                role: "teacher",
+                classId: null,
+              },
+              { transaction: t },
+            );
+          }
+        }
+      }
+
+      // 4. TRACK B: Map General Subject Multi-Class Coverage Linkages
+      if (
+        subjectName &&
+        subjectName.trim().length > 0 &&
+        classId &&
+        classId !== "undefined" &&
+        classId !== ""
+      ) {
+        const cleanSubject = subjectName.trim();
+
+        if (teacher.role === "staff") {
+          await teacher.update({ role: "teacher" }, { transaction: t });
+        }
+
+        const duplicateExists = await AcademicYearTeacher.findOne({
+          where: {
+            academicYearId,
+            teacherId,
+            classId,
+            subjectName: cleanSubject,
+            instituteId,
+          },
+        });
+
+        if (!duplicateExists) {
+          await AcademicYearTeacher.create(
+            {
+              id: crypto.randomUUID(),
+              instituteId,
+              academicYearId,
+              teacherId,
+              classId,
+              subjectName: cleanSubject,
+            },
+            { transaction: t },
+          );
+        }
+      }
+
+      await t.commit();
       return res.json({
         message:
-          "Classroom assignment synchronized successfully for the selected educational cycle.",
+          "Faculty multi-class subject assignment matrix synchronized successfully.",
       });
     } catch (err) {
+      await t.rollback();
       return res.status(500).json({ message: err.message });
     }
   }
@@ -452,6 +588,27 @@ class AuthController {
 
       return res.json({
         message: "Student profile extensions updated successfully.",
+      });
+    } catch (err) {
+      return res.status(500).json({ message: err.message });
+    }
+  }
+  async revokeSubjectAssignment(req, res) {
+    try {
+      const { assignmentId } = req.params;
+      const { AcademicYearTeacher } = require("../models/index");
+
+      const entry = await AcademicYearTeacher.findOne({
+        where: { id: assignmentId, instituteId: req.user.instituteId },
+      });
+      if (!entry)
+        return res.status(404).json({
+          message: "Subject assignment mapping record not discovered.",
+        });
+
+      await entry.destroy();
+      return res.json({
+        message: "Subject allocation dropped cleanly from matrix directories.",
       });
     } catch (err) {
       return res.status(500).json({ message: err.message });

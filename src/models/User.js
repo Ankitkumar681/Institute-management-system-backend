@@ -24,6 +24,7 @@ const User = sequelize.define(
         "staff",
         "class_teacher",
         "student",
+        "teacher"
       ),
       allowNull: false,
     },

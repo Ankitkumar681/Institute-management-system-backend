@@ -277,6 +277,7 @@ class AttendanceService {
     const {
       Classroom,
       AcademicYearStaff,
+      AcademicYearTeacher, // 🚀 NEW: Import multi-class subject mapping matrix model
       Attendance,
       User,
       AcademicYear,
@@ -302,22 +303,49 @@ class AttendanceService {
       attendanceWhere.academicYearId = targetYearId;
     }
 
-    // 🔒 THE CLASS TEACHER ENVELOPE FILTER
-    if (user.role === "class_teacher") {
-      const activeAssignments = await AcademicYearStaff.findAll({
-        where: {
-          teacherId: user.id,
-          instituteId,
-          ...(targetYearId && { academicYearId: targetYearId }),
-        },
-        attributes: ["classId"],
-        raw: true,
-      });
-      const assignedClassIds = activeAssignments.map((a) => a.classId);
+    // 🔒 REFACTORED SHARED TEACHER SECURITY FILTER
+    // Authorizes both primary class_teachers and general multi-class subject teachers
+    if (
+      user.role === "class_teacher" ||
+      user.role === "teacher" ||
+      user.role === "staff"
+    ) {
+      const [primaryPlacements, subjectPlacements] = await Promise.all([
+        // 1. Fetch classrooms where they hold the primary Class Teacher slot
+        AcademicYearStaff.findAll({
+          where: {
+            teacherId: user.id,
+            instituteId,
+            ...(targetYearId && { academicYearId: targetYearId }),
+          },
+          attributes: ["classId"],
+          raw: true,
+        }),
+        // 2. Fetch classrooms where they are mapped as a Subject Teacher
+        AcademicYearTeacher.findAll({
+          where: {
+            teacherId: user.id,
+            instituteId,
+            ...(targetYearId && { academicYearId: targetYearId }),
+          },
+          attributes: ["classId"],
+          raw: true,
+        }),
+      ]);
 
-      // Strict constraint override: Force queries to only see their year-specific class allocations
+      // Combine and de-duplicate classId keys into a unique flat array list
+      const combinedClassIds = [
+        ...primaryPlacements.map((a) => a.classId),
+        ...subjectPlacements.map((s) => s.classId),
+      ];
+      const uniqueAuthorizedClassIds = [...new Set(combinedClassIds)];
+
+      // Strict constraint override: Scope data visibility exclusively to their assigned domains
       const targetedIds =
-        assignedClassIds.length > 0 ? assignedClassIds : ["_FORCE_EMPTY_"];
+        uniqueAuthorizedClassIds.length > 0
+          ? uniqueAuthorizedClassIds
+          : ["_FORCE_EMPTY_"];
+
       classroomWhere.id = { [Op.in]: targetedIds };
       attendanceWhere.classId = { [Op.in]: targetedIds };
     }
@@ -353,7 +381,7 @@ class AttendanceService {
     const classroomMatrix = [];
 
     for (const cls of classrooms) {
-      // Find who the teacher assigned to this classroom was for this year cycle
+      // Find who the primary class teacher assigned to this classroom was for this year cycle
       const staffMap = await AcademicYearStaff.findOne({
         where: {
           classId: cls.id,
@@ -372,7 +400,6 @@ class AttendanceService {
         (l) => l.status === "Present" || l.status === "Late",
       ).length;
 
-      // Formulates total class rate precisely, safeguarding against NaN or 0 display bugs
       const clsRate =
         clsTotal > 0 ? Math.round((clsPresent / clsTotal) * 100) : 0;
 
@@ -386,7 +413,6 @@ class AttendanceService {
       });
     }
 
-    // 🚀 STEP 5: RETURN COMPILED ENVELOPE TRANSPARENTLY TO THE CONTROLLER LAYER
     return {
       analytics: {
         totalLogs,
@@ -482,6 +508,7 @@ class AttendanceService {
     const {
       Attendance,
       AcademicYearStaff,
+      AcademicYearTeacher, // 🚀 NEW: Import multi-class subject mapping matrix model
       AcademicYear,
     } = require("../models/index");
     const sequelize = require("../config/db");
@@ -503,21 +530,44 @@ class AttendanceService {
       whereCondition.academicYearId = targetYearId;
     }
 
-    // 🔒 THE CLASS TEACHER SECURITY GUARD: Restrict data query strictly to their assigned classes
-    if (user.role === "class_teacher") {
-      const activeAssignments = await AcademicYearStaff.findAll({
-        where: {
-          teacherId: user.id,
-          instituteId,
-          ...(targetYearId && { academicYearId: targetYearId }),
-        },
-        attributes: ["classId"],
-        raw: true,
-      });
-      const assignedClassIds = activeAssignments.map((a) => a.classId);
+    // 🔒 REFACTORED SHARED TEACHER SECURITY FILTER (TREND LINES)
+    if (
+      user.role === "class_teacher" ||
+      user.role === "teacher" ||
+      user.role === "staff"
+    ) {
+      const [primaryPlacements, subjectPlacements] = await Promise.all([
+        AcademicYearStaff.findAll({
+          where: {
+            teacherId: user.id,
+            instituteId,
+            ...(targetYearId && { academicYearId: targetYearId }),
+          },
+          attributes: ["classId"],
+          raw: true,
+        }),
+        AcademicYearTeacher.findAll({
+          where: {
+            teacherId: user.id,
+            instituteId,
+            ...(targetYearId && { academicYearId: targetYearId }),
+          },
+          attributes: ["classId"],
+          raw: true,
+        }),
+      ]);
+
+      const combinedClassIds = [
+        ...primaryPlacements.map((a) => a.classId),
+        ...subjectPlacements.map((s) => s.classId),
+      ];
+      const uniqueAuthorizedClassIds = [...new Set(combinedClassIds)];
+
       whereCondition.classId = {
         [Op.in]:
-          assignedClassIds.length > 0 ? assignedClassIds : ["_FORCE_EMPTY_"],
+          uniqueAuthorizedClassIds.length > 0
+            ? uniqueAuthorizedClassIds
+            : ["_FORCE_EMPTY_"],
       };
     }
 
@@ -559,7 +609,6 @@ class AttendanceService {
       "December",
     ];
 
-    // Seed an empty trend matrix baseline
     const trendMap = {};
     chronologicalMonths.forEach((m) => {
       trendMap[m] = { month: m, rate: 0, logs: 0 };
@@ -577,7 +626,6 @@ class AttendanceService {
       }
     });
 
-    // Return a clean flat array list sorted from January to December
     return chronologicalMonths.map((m) => trendMap[m]);
   }
 }
